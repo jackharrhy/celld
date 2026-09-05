@@ -252,6 +252,18 @@ pub(crate) fn action_from_process() -> anyhow::Result<Action> {
             "the internal development store requires the celld dev node configuration"
         );
     }
+    if let Some(spec) = &settings.bucket {
+        if celld::local_storage::path_from_spec(spec)?.is_some() {
+            anyhow::ensure!(
+                !settings.control_plane,
+                "sqlite:// storage runs standalone without --control-plane / CELLD_CLOUD"
+            );
+            anyhow::ensure!(
+                settings.dev_store.is_none(),
+                "sqlite:// storage cannot be combined with the internal dev store"
+            );
+        }
+    }
     Ok(if diagnose {
         Action::Diagnose {
             settings,
@@ -269,6 +281,7 @@ pub(crate) fn print_help() -> anyhow::Result<()> {
         r#"celld — self-hosted, distributed Durable Objects
 
 USAGE:
+  celld --bucket sqlite:///absolute/path/objects.sqlite3 [OPTIONS]
   celld --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
@@ -321,7 +334,9 @@ OPTIONS:
 
 ENVIRONMENT:
   Boolean variables accept only `0` or `1`; invalid values stop startup.
-  CELLD_BUCKET                    Fleet bucket and prefix; same as --bucket
+  CELLD_BUCKET                    Cloud bucket or sqlite:///absolute/path/objects.sqlite3
+                                  SQLite: one node on persistent local disk;
+                                  deploy and operator commands use the same URI
   S3_ENDPOINT                     S3-compatible endpoint; same as --endpoint
   AWS_REGION, AWS_DEFAULT_REGION  Storage region (default: us-east-1)
   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN

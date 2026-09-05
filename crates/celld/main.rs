@@ -3680,6 +3680,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         Action::Run(settings) => settings,
     };
+    // One runtime per local authority. Deploy/diagnose use SQLite normally;
+    // offline migration takes this same guard and cannot race a running node.
+    let _local_store_guard = settings
+        .bucket
+        .as_deref()
+        .map(celld::local_storage::path_from_spec)
+        .transpose()?
+        .flatten()
+        .map(|database| celld::local_storage::lock_runtime(&database))
+        .transpose()?;
     celld::startup::raise_file_limit();
     let max_resident = celld::env_vars::optional("CELLD_MAX_RESIDENT_CELLS")?
         // celld has no resident ceiling unless the operator configures one.
@@ -3723,7 +3733,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     celld::bucket::StorageBackend::Gcs => "gs",
                     celld::bucket::StorageBackend::Azure => "az",
                     celld::bucket::StorageBackend::S3 => "s3",
-                    celld::bucket::StorageBackend::Local => "dev",
+                    celld::bucket::StorageBackend::Local => "sqlite",
                 }
             );
             // The control plane issues one bucket per fleet and its enrollment
@@ -5227,7 +5237,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // a status request is not itself allowed to bypass the drain deadline.
             let status = before_process_deadline(
                 handoff_deadline,
-                tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status()),
+                tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                app.drain_status(),
+            ),
             )
             .await
             .and_then(Result::ok);

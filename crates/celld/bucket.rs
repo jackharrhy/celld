@@ -88,7 +88,7 @@ impl StorageBackend {
             StorageBackend::S3 => "s3",
             StorageBackend::Gcs => "gs",
             StorageBackend::Azure => "az",
-            StorageBackend::Local => "dev",
+            StorageBackend::Local => "sqlite",
         }
     }
 
@@ -252,6 +252,9 @@ pub fn split_spec(spec: &str) -> (StorageBackend, &str, String) {
             .filter(|candidate| candidate.eq_ignore_ascii_case(scheme))
             .map(|_| &spec[scheme.len()..])
     };
+    if let Some(database) = strip_scheme("sqlite://") {
+        return (StorageBackend::Local, database, String::new());
+    }
     let (backend, spec) = if let Some(rest) = strip_scheme("gs://") {
         (StorageBackend::Gcs, rest)
     } else if let Some(rest) = strip_scheme("az://") {
@@ -550,7 +553,8 @@ impl Bucket {
         }
     }
 
-    /// `bucket` is `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every
+    /// `bucket` is `sqlite:///absolute/path/objects.sqlite3` for a local
+    /// single-node authority, or `[s3://|gs://|az://]NAME[/PREFIX]`. With a PREFIX every
     /// key this client reads or writes lives under `PREFIX/`, so several
     /// fleets can share one bucket without colliding.
     ///
@@ -588,9 +592,7 @@ impl Bucket {
         )
     }
 
-    /// Open the machine-local development store. Only the `celld dev`
-    /// supervisor and its child node receive this constructor; fleet flags
-    /// continue to resolve exclusively through the cloud backend parser.
+    /// The dev supervisor shares the standalone local store implementation.
     pub(crate) fn open_dev(database: &std::path::Path) -> anyhow::Result<Bucket> {
         let store = Arc::new(crate::local_store::LocalStore::open(database)?);
         Ok(Bucket {
@@ -616,6 +618,17 @@ impl Bucket {
         app: Option<&str>,
         sources: CloudSources,
     ) -> anyhow::Result<Bucket> {
+        if let Some(database) = crate::local_storage::path_from_spec(bucket)? {
+            anyhow::ensure!(
+                endpoint.is_none(),
+                "sqlite:// storage takes no endpoint; unset --endpoint / S3_ENDPOINT"
+            );
+            anyhow::ensure!(
+                credentials.is_none(),
+                "sqlite:// storage takes no cloud credentials"
+            );
+            return Self::open_dev(&database);
+        }
         let CloudSources {
             gcs: gcs_builder,
             azure: azure_env,
@@ -772,7 +785,7 @@ impl Bucket {
                 )
             }
             StorageBackend::Local => {
-                unreachable!("the local development store has its own constructor")
+                unreachable!("local storage is opened before constructing cloud clients")
             }
         };
         Ok(Bucket {
@@ -2028,4 +2041,68 @@ pub fn is_unauthorized(error: &anyhow::Error) -> bool {
             || text.contains("status code: 403 Forbidden")
             || text.contains("status code: 401 Unauthorized")
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod local_backend_tests {
+    use super::*;
+
+    #[test]
+    fn local_spec_uses_the_entire_path_without_a_key_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("store/objects.sqlite3");
+        let spec = format!("sqlite://{}", database.display());
+        let (backend, name, prefix) = split_spec(&spec);
+        assert_eq!(backend, StorageBackend::Local);
+        assert_eq!(name, database.to_str().unwrap());
+        assert!(prefix.is_empty());
+        let bucket = Bucket::open(&spec, None, "us-east-1", None, None).unwrap();
+        assert_eq!(bucket.backend(), StorageBackend::Local);
+        assert_eq!(bucket.scheme(), "sqlite");
+        assert_eq!(bucket.name, name);
+        assert!(database.is_file());
+        assert!(bucket.prefix.is_empty());
+    }
+
+    #[test]
+    fn local_spec_rejects_cloud_overrides_before_creating_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("objects.sqlite3");
+        let spec = format!("sqlite://{}", database.display());
+        assert!(Bucket::open(
+            &spec,
+            Some("http://localhost:9000"),
+            "us-east-1",
+            None,
+            None
+        )
+        .is_err());
+        assert!(Bucket::open(
+            &spec,
+            None,
+            "us-east-1",
+            Some(StaticCredentials {
+                access_key_id: "test".into(),
+                secret_access_key: "test".into(),
+                session_token: None,
+            }),
+            None
+        )
+        .is_err());
+        assert!(!database.exists());
+        assert!(Bucket::open("sqlite://relative/path", None, "us-east-1", None, None).is_err());
+    }
+
+    #[test]
+    fn cloud_bucket_prefix_parsing_is_preserved() {
+        assert_eq!(
+            split_spec("az://radio/a//b/"),
+            (StorageBackend::Azure, "radio", "a/b/".into())
+        );
+        assert_eq!(
+            split_spec("plain/prefix"),
+            (StorageBackend::S3, "plain", "prefix/".into())
+        );
+    }
 }

@@ -344,6 +344,7 @@ pub mod generation;
 pub mod host_services;
 pub mod js;
 pub mod kv_cli;
+pub mod local_storage;
 pub(crate) mod local_store;
 pub mod ltx_repl;
 pub mod machine;

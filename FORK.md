@@ -51,6 +51,27 @@ publication. Large objects use bounded chunks inside SQLite. Existing dev-store
 inline objects remain readable, but the new chunked format cannot be opened by
 older Celld builds. Preserve pre-upgrade backups when changing formats.
 
+## Memory admission after large local writes
+
+Release `0.4.1-jh.2` fixes a failure found during the final Radio container test:
+with one CPU, 1 GiB memory and no swap, a 1 GiB upload filled the cgroup with
+inactive filesystem cache. The previous hard-pressure rule used the full cgroup
+charge and refused the upload's final Durable Object activation despite modest
+process RSS and working-set usage. Host-process qualification had not exposed
+that container-specific failure.
+
+The hard-pressure metric now uses the greater of process RSS and the cgroup
+working set, retaining allocator memory and active kernel charges. It excludes
+inactive file cache using the existing telemetry calculation; missing or invalid
+statistics fall back to the full charge. Ordinary limits, the 95% hard watermark,
+and hysteresis remain enabled. Linux documents why a network-to-file workload
+can fill available memory without needing it to operate in its
+[cgroup memory guidance](https://docs.kernel.org/admin-guide/cgroup-v2.html#usage-guidelines).
+
+The final Radio image must pass the same constrained 1 GiB upload, restart and
+state/media checks before live cutover. Backend and unrestricted host-process
+checks alone do not qualify this deployment.
+
 ## Backup and recovery
 
 For this initial deployment, stop the application runtime and all operators,

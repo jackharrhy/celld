@@ -2574,8 +2574,8 @@ impl Actor {
                 let now_mono_ms = crate::asyncrt::mono_ms();
                 self.drive(Event::LoadSampled { load, now_mono_ms }, out);
                 // Report a change of shed reason once. `rss-hard` retains its
-                // established name, but in a Linux cgroup it says
-                // `memory.current` crossed the absolute cap.
+                // established name; RSS or the cgroup working set crossed the
+                // absolute cap without an allocator-retention discount.
                 let reason = self.state.shed_reason();
                 if reason != self.logged_shed_reason {
                     self.logged_shed_reason = reason;

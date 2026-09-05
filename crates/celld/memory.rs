@@ -5,7 +5,7 @@
 //! Process RSS and cgroup memory answer different questions. RSS describes the
 //! process, while `memory.current` is the complete charge that the kernel
 //! constrains. `memory.stat` identifies inactive file pages that the kernel can
-//! reclaim, so the ordinary pressure measurement does not treat that cache as
+//! reclaim, so pressure measurements do not treat that cache as
 //! a cell working set. [`sample`] obtains the measurements in one sampling
 //! turn and keeps their relationship intact.
 
@@ -68,7 +68,7 @@ fn cgroup_memory() -> Option<CgroupMemory> {
     None
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(any(target_os = "linux", test))]
 fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     stat.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -78,7 +78,7 @@ fn memory_stat_value(stat: &str, key: &str) -> Option<u64> {
     })
 }
 
-#[cfg(any(target_os = "linux", all(test, celld_internal_tests)))]
+#[cfg(any(target_os = "linux", test))]
 fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -> CgroupMemory {
     let inactive_file_bytes = memory_stat_value(stat, inactive_key)
         .or_else(|| {
@@ -91,7 +91,7 @@ fn cgroup_memory_from_stat(current_bytes: u64, stat: &str, inactive_key: &str) -
         current_bytes,
         // The files are separate kernel snapshots. If the inactive charge
         // races above the earlier current charge, using zero would hide all
-        // active memory from the ordinary pressure and rollout gates.
+        // active memory from the pressure and rollout gates.
         working_set_bytes: current_bytes
             .checked_sub(inactive_file_bytes)
             .unwrap_or(current_bytes),
@@ -198,4 +198,52 @@ pub fn tune_allocator() {
 #[cfg(all(test, celld_internal_tests))]
 mod internal_tests {
     include!(env!("CELLD_INTERNAL_MEMORY_TESTS"));
+}
+
+#[cfg(test)]
+mod cgroup_stat_tests {
+    use super::cgroup_memory_from_stat;
+
+    #[test]
+    fn inactive_file_deduction_keeps_anonymous_and_kernel_charges() {
+        let memory = cgroup_memory_from_stat(
+            1_073_741_824,
+            "anon 281075712\nfile 760799232\nkernel 25444352\ninactive_file 750202880\nactive_file 10588160\n",
+            "inactive_file",
+        );
+        assert_eq!(memory.current_bytes, 1_073_741_824);
+        assert_eq!(memory.working_set_bytes, 323_538_944);
+    }
+
+    #[test]
+    fn missing_invalid_or_racing_stats_keep_the_full_charge() {
+        for stat in [
+            "",
+            "anon 900",
+            "inactive_file invalid",
+            "inactive_file 18446744073709551616",
+            "inactive_file 1001",
+        ] {
+            let memory = cgroup_memory_from_stat(1000, stat, "inactive_file");
+            assert_eq!(memory.working_set_bytes, 1000, "{stat:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_cgroup_uses_hierarchical_inactive_file_with_local_fallback() {
+        assert_eq!(
+            cgroup_memory_from_stat(
+                1000,
+                "total_inactive_file 400\ninactive_file 100",
+                "total_inactive_file"
+            )
+            .working_set_bytes,
+            600
+        );
+        assert_eq!(
+            cgroup_memory_from_stat(1000, "inactive_file 100", "total_inactive_file")
+                .working_set_bytes,
+            900
+        );
+    }
 }

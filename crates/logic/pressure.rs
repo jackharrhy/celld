@@ -21,18 +21,15 @@ pub struct PressureConfig {
     /// The ceiling on the memory the cells hold. This is the ordinary limit,
     /// and `CELLD_MAX_RSS_MB` sets it.
     pub high_bytes: Option<u64>,
-    /// An absolute ceiling on the cgroup charge, or process RSS when the
-    /// process has no readable cgroup: 95% of the available memory.
+    /// An absolute ceiling on process RSS and the cgroup working set:
+    /// 95% of the available memory, without an allocator-slack discount.
     ///
     /// `high_bytes` applies to allocator-adjusted RSS and to the active cgroup
-    /// working set after the same allocator adjustment. The adjustment lets a
-    /// node recover after a free, and the cgroup measurement includes active
-    /// kernel charges outside RSS. Neither measurement includes every charge
-    /// that the cgroup limit uses.
-    ///
-    /// This is the floor under that trade. A container reads
-    /// `memory.current`, so kernel charges outside process RSS cannot hide
-    /// from it.
+    /// working set after the same allocator adjustment. This separate cap
+    /// catches retained allocator pages and active kernel charges outside RSS.
+    /// Inactive file cache is excluded from both ceilings: local file I/O can
+    /// fill the cgroup with reclaimable cache that cell eviction cannot release.
+    /// If working-set telemetry is unavailable, use the complete cgroup charge.
     ///
     /// It is a fixed share of the machine and is never derived from
     /// `high_bytes`. A first attempt placed it "at least 125% of the ceiling",
@@ -62,13 +59,14 @@ pub struct Latches {
 /// The futility stop compares a sample with the one the last cut measured, so
 /// it has to know that the two samples are the same measurement. They are not
 /// interchangeable: eviction moves the ordinary working-set figure at once and
-/// may never move the complete cgroup charge at all.
+/// may leave allocator-retained RSS unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
     /// The greater of allocator-adjusted RSS and the allocator-adjusted active
     /// cgroup working set. An eviction can return this memory.
     InUse,
-    /// The complete cgroup charge, with process RSS as a host fallback.
+    /// The greater of RSS and the cgroup working set, without subtracting
+    /// allocator retention. Raw cgroup charge is the telemetry fallback.
     Rss,
 }
 
@@ -78,7 +76,7 @@ pub enum Metric {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Load {
     pub resident_cells: usize,
-    /// Reported to peers and operators, never decided on.
+    /// Process RSS; also the floor for the hard pressure measurement.
     pub rss_bytes: u64,
     /// RSS minus the pages the allocator keeps but nothing uses. This is the
     /// ordinary pressure fallback when no cgroup working set is readable.
@@ -107,10 +105,20 @@ impl Load {
         self.in_use_bytes.max(cgroup_in_use)
     }
 
-    /// The hard pressure measurement. `memory.current` is authoritative when
-    /// present because the cgroup limit constrains it, not process RSS.
+    /// The hard pressure measurement keeps allocator retention and active
+    /// kernel charges, but excludes the same inactive file cache as ordinary
+    /// pressure. The kernel can reclaim that cache without evicting a cell.
+    /// A file-writing workload can otherwise latch admission permanently at
+    /// the cgroup limit even when its process and active charges are small.
+    ///
+    /// Keep RSS as a floor because cgroup/RSS shared-page accounting differs.
+    /// Missing working-set telemetry falls back to the full cgroup charge.
     pub fn hard_bytes(self) -> u64 {
-        self.cgroup_current_bytes.unwrap_or(self.rss_bytes)
+        self.rss_bytes.max(
+            self.cgroup_working_set_bytes
+                .or(self.cgroup_current_bytes)
+                .unwrap_or_default(),
+        )
     }
 
     pub fn metric_bytes(self, metric: Metric) -> u64 {
@@ -125,9 +133,8 @@ impl Load {
 /// This is the ordinary case, and shedding relieves it.
 pub const SHED_MEMORY: &str = "memory";
 
-/// The latch engaged because the complete cgroup charge, or the RSS fallback,
-/// crossed the absolute cap. The string keeps its established telemetry name,
-/// but a Linux container decides it from `memory.current`.
+/// The latch engaged because RSS or the cgroup working set crossed the
+/// absolute cap. The string keeps its established telemetry name.
 pub const SHED_RSS_HARD: &str = "rss-hard";
 
 impl PressureConfig {
@@ -178,8 +185,8 @@ impl PressureConfig {
 
     /// Does the ceiling sit at or above the absolute cap?
     ///
-    /// Then the cap is the effective limit and the node decides on its complete
-    /// cgroup charge or RSS fallback. That is the operator's
+    /// Then the cap is the effective limit and the node decides on its RSS and
+    /// cgroup working set without an allocator discount. That is the operator's
     /// choice -- they asked for a ceiling above the safety floor -- but it
     /// gives up the recovery property of this module, so the shell reports it.
     pub fn ceiling_above_cap(self) -> bool {

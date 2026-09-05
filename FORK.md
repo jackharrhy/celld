@@ -2,9 +2,8 @@
 
 This repository follows `denoland/celld` and carries a local object-store option
 for standalone applications. `fork.json` records the tested upstream revision,
-fork release version and Rust toolchain. The application currently qualifying
-this mode is [Radio](https://github.com/jackharrhy/radio). Worldview integration
-is separate work.
+fork release version and Rust toolchain. [Radio](https://github.com/jackharrhy/radio)
+and [Worldview](https://github.com/jackharrhy/worldview) use this mode.
 
 The fork also carries two R2 compatibility repairs found by Radio's live-runtime
 tests: full reads omit the optional range record, and new R2 envelope metadata
@@ -12,17 +11,21 @@ uses the Azure-safe `celld_r2` key while still reading the older `celld-r2` key.
 
 ## Consume a release
 
-The fork workflow builds and tests a Linux amd64 image at
-`ghcr.io/jackharrhy/celld:sha-<full-fork-commit>`. A `fork-*` Git tag also publishes
-the corresponding image tag. The workflow summary gives the immutable digest.
-Application Dockerfiles copy `/usr/local/bin/celld` from that image, pinned by
-digest. The image also contains `/usr/local/bin/celld-store-copy` for an offline
-one-time migration. Do not build Rust inside each application or depend on a
-local experiment checkout.
+Successful main builds publish `ghcr.io/jackharrhy/celld:latest` for Linux amd64.
+Application Dockerfiles copy `/usr/local/bin/celld` from that image and refresh
+their base images when building. Applications publish their own `:latest` images;
+the normal `infra update HOST` and `infra refresh HOST` workflow deploys them.
+A fork update reaches an application on its next image build.
+
+Commit tags (`sha-<full-fork-commit>`), optional `fork-*` release tags and image
+digests remain available for debugging or restoring an older version. They do
+not require a manual promotion step. The image also includes
+`/usr/local/bin/celld-store-copy` for the one-time offline backend migration.
+Applications need neither a Rust build nor a local experiment checkout.
 
 Image labels record the fork commit, fork version and upstream revision.
 `celld --version` retains the upstream package version and is not sufficient to
-identify this fork. Promote a tested image digest explicitly in each consumer.
+identify this fork.
 
 ## Standalone local storage
 
@@ -68,9 +71,9 @@ and hysteresis remain enabled. Linux documents why a network-to-file workload
 can fill available memory without needing it to operate in its
 [cgroup memory guidance](https://docs.kernel.org/admin-guide/cgroup-v2.html#usage-guidelines).
 
-The final Radio image must pass the same constrained 1 GiB upload, restart and
-state/media checks before live cutover. Backend and unrestricted host-process
-checks alone do not qualify this deployment.
+The corrected release passed the constrained 1 GiB upload, restart and
+state/media checks. Keep this regression harness available when changing storage
+or memory behavior; ordinary application rollouts use their normal CI checks.
 
 ## Backup and recovery
 
@@ -94,8 +97,8 @@ the remaining diff against that upstream revision, remove fixes now supplied
 upstream, and update `fork.json` to the new upstream revision and fork version.
 Resolve conflicts in that branch; never rewrite published release tags.
 
-Run the workspace tests, clippy, storage/migration checks and Radio's real-Celld
-smoke before promoting a release. The Docker build depends on its test stage.
+The Docker build runs workspace tests, clippy and storage/migration checks before
+publishing. Application CI also exercises its real-Celld smoke.
 Upstream's private suites are not included in its public checkout, so passing
 the shipped tests alone is not application qualification. A successful sync
 does not automatically update running applications.

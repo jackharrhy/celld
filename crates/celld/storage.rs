@@ -663,9 +663,13 @@ fn authorize_sql(context: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::
 fn without_sql_authorizer<T>(connection: &Connection, callback: impl FnOnce() -> T) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
 
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("disable the SQL authorizer on an idle connection");
     let result = callback();
-    connection.authorizer(Some(authorize_sql));
+    connection
+        .authorizer(Some(authorize_sql))
+        .expect("restore the SQL authorizer on an idle connection");
     result
 }
 
@@ -675,9 +679,13 @@ fn without_sql_authorizer_mut<T>(
 ) -> T {
     use rusqlite::hooks::{AuthContext, Authorization};
 
-    connection.authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    connection
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("disable the SQL authorizer on an idle connection");
     let result = callback(connection);
-    connection.authorizer(Some(authorize_sql));
+    connection
+        .authorizer(Some(authorize_sql))
+        .expect("restore the SQL authorizer on an idle connection");
     result
 }
 
@@ -814,7 +822,7 @@ fn finish_open(
             rusqlite::ffi::sqlite3_limit(database, category, limit);
         }
     }
-    c.authorizer(Some(authorize_sql));
+    c.authorizer(Some(authorize_sql))?;
     // rusqlite's default holds 16 statements; the KV texts plus a cell's
     // few hot user statements fit in 64 without evicting each other.
     c.set_prepared_statement_cache_capacity(64);
@@ -1015,11 +1023,7 @@ pub(crate) fn open_embedded(
         .optional()?;
     let mut connection = Connection::open_in_memory()?;
     if let Some(image) = image {
-        connection.deserialize(
-            rusqlite::DatabaseName::Main,
-            owned_sqlite_data(&image)?,
-            false,
-        )?;
+        connection.deserialize("main", owned_sqlite_data(&image)?, false)?;
         // A runtime incarnation has a unique scope so a continuation from an
         // aborted instance cannot enter its replacement. The SQLite image is
         // one logical facet, so move the legacy per-cell keys to that new
@@ -1069,7 +1073,7 @@ pub(crate) fn flush_embedded(scope: &str) {
             return Ok(());
         }
         let image = without_sql_authorizer(&cell.connection, || {
-            cell.connection.serialize(rusqlite::DatabaseName::Main)
+            cell.connection.serialize("main")
         })
         .context("serialize the facet database")?
         .to_vec();

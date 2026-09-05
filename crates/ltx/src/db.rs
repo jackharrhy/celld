@@ -1384,7 +1384,7 @@ impl Db {
         // capture" — a silent miss the ship loop would then credit. The
         // mismatch path therefore re-reads the complete WAL first, which is
         // exactly the port's former full-read behavior on this branch.
-        let mismatch = !(info.offset == WAL_HEADER_SIZE as i64)
+        let mismatch = info.offset != WAL_HEADER_SIZE as i64
             && matches!(
                 wal.reader_at(info.offset, info.salt1, info.salt2),
                 Err(crate::wal::WalError::PrevFrameMismatch)
@@ -2267,7 +2267,8 @@ pub mod internal {
             conn.authorizer(Some(move |_: AuthContext<'_>| {
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Authorization::Allow
-            }));
+            }))
+            .expect("install the compilation counter on an idle connection");
         }
         counter
     }

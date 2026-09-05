@@ -63,8 +63,9 @@ const STREAM_PART: usize = 8 << 20;
 const PART_BACKLOG: usize = 256 << 20;
 
 /// The user-metadata name the R2 object record lives under. See
-/// [`Envelope`].
-const ENVELOPE: &str = "celld-r2";
+/// [`Envelope`]. Azure metadata names require identifier characters, so new
+/// objects use an underscore. Keep reading the original spelling as well.
+const ENVELOPE: &str = "celld_r2";
 
 /// The key space one binding owns inside the fleet bucket. `bucket_name`
 /// comes from the deployment manifest, which validates it, so the prefix
@@ -142,6 +143,12 @@ impl Envelope {
             .metadata
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(ENVELOPE))
+            .or_else(|| {
+                attributes
+                    .metadata
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("celld-r2"))
+            })
             .and_then(|(_, value)| serde_json::from_str::<Self>(value).ok())
             .unwrap_or_else(|| Self {
                 custom: attributes
@@ -198,7 +205,7 @@ fn ascii_json<T: Serialize>(value: &T) -> String {
 }
 
 /// One R2 object, in the shape `__makeR2Bucket` turns into an `R2Object`.
-/// `range` is present only on the answer to a `get`.
+/// `range` is present only on the answer to a ranged `get`.
 fn object_json(key: &str, meta: &BlobMeta, range: Option<(u64, u64)>) -> serde_json::Value {
     let envelope = Envelope::read(&meta.attributes);
     let mut json = serde_json::json!({
@@ -451,6 +458,7 @@ pub(super) fn op_r2_get(
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let request = request?;
+        let ranged = request.range.is_some();
         let range = request
             .range
             .map(BlobRange::from)
@@ -473,7 +481,7 @@ pub(super) fn op_r2_get(
                     .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
                 serde_json::json!({
                     "state": "hit",
-                    "object": object_json(&key, &blob.meta, Some(blob.range)),
+                    "object": object_json(&key, &blob.meta, ranged.then_some(blob.range)),
                     "streamId": stream_id,
                 })
                 .to_string()
@@ -1285,4 +1293,41 @@ pub(super) fn op_r2_mp_abort(
             Ok(String::new())
         });
     rv.set(promise_for(scope, id));
+}
+
+#[cfg(test)]
+mod envelope_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn reads_legacy_and_azure_safe_envelopes_with_folded_key_case() {
+        for name in ["CELLD-R2", "CELLD_R2"] {
+            let attributes = BlobAttributes {
+                content_type: Some("audio/wav".into()),
+                metadata: vec![(name.into(), r#"{"custom":{"artist":"Björk"},"http":{"cacheExpiry":123},"checksums":{"md5":"abcd"}}"#.into())],
+                ..Default::default()
+            };
+            let envelope = Envelope::read(&attributes);
+            assert_eq!(envelope.custom.get("artist").unwrap(), "Björk");
+            assert_eq!(envelope.http.content_type.as_deref(), Some("audio/wav"));
+            assert_eq!(envelope.http.cache_expiry, Some(123));
+            assert_eq!(envelope.checksums.get("md5").unwrap(), "abcd");
+            let encoded = envelope.write();
+            assert_eq!(encoded.metadata[0].0, "celld_r2");
+            assert!(encoded.metadata[0].1.is_ascii());
+            assert_eq!(Envelope::read(&encoded).custom, envelope.custom);
+        }
+    }
+
+    #[test]
+    fn older_objects_without_an_envelope_keep_their_metadata() {
+        let attributes = BlobAttributes {
+            content_type: Some("audio/mpeg".into()),
+            metadata: vec![("mtime".into(), "1700000000000".into())],
+            ..Default::default()
+        };
+        let envelope = Envelope::read(&attributes);
+        assert_eq!(envelope.custom.get("mtime").unwrap(), "1700000000000");
+        assert_eq!(envelope.http.content_type.as_deref(), Some("audio/mpeg"));
+    }
 }

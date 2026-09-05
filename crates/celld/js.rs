@@ -11718,7 +11718,7 @@ impl IoContext {
 
     fn release_input_gate(&self, cell: &str, event: celld_logic::gate::EventId) -> bool {
         let mut claims = self.input_gates.lock().unwrap();
-        if !claims.held.get(&event).is_some_and(|owned| owned == cell) {
+        if claims.held.get(&event).is_none_or(|owned| owned != cell) {
             return false;
         }
         claims.held.remove(&event);

@@ -34,7 +34,7 @@ env:
 jobs:
   build-celld:
     name: Build celld ${{ matrix.target }}
-    if: github.event_name != 'release'
+    if: github.repository == 'denoland/celld' && github.event_name != 'release'
     strategy:
       fail-fast: false
       matrix:
@@ -78,7 +78,7 @@ jobs:
   # be published; nothing is pushed at candidate time.
   container-check:
     name: Container smoke build
-    if: github.event_name != 'release'
+    if: github.repository == 'denoland/celld' && github.event_name != 'release'
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     permissions:
@@ -109,7 +109,7 @@ jobs:
 
   draft-release:
     name: Attest and draft the release
-    if: github.event_name != 'release'
+    if: github.repository == 'denoland/celld' && github.event_name != 'release'
     needs:
       - build-celld
     runs-on: ubuntu-22.04
@@ -189,7 +189,7 @@ jobs:
     # unexpanded matrix expression; GitHub still appends the platform when
     # the job actually runs.
     name: Build container
-    if: github.event_name == 'release'
+    if: github.repository == 'denoland/celld' && github.event_name == 'release'
     strategy:
       fail-fast: false
       matrix:
@@ -248,7 +248,7 @@ jobs:
 
   publish-container:
     name: Publish multi-architecture image
-    if: github.event_name == 'release'
+    if: github.repository == 'denoland/celld' && github.event_name == 'release'
     needs: build-container
     runs-on: ubuntu-24.04
     timeout-minutes: 15

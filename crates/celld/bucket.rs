@@ -58,6 +58,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(all(test, celld_internal_tests))]
+mod internal_tests {
+    include!(env!("CELLD_INTERNAL_BUCKET_TESTS"));
+}
+
 /// Explicit credentials for a managed installation; everything else comes
 /// from the standard `AWS_*` environment.
 pub struct StaticCredentials {
@@ -135,6 +140,28 @@ impl StorageBackend {
                 "If-Match / If-None-Match"
             }
             StorageBackend::Gcs => "x-goog-if-generation-match",
+        }
+    }
+
+    /// How a user-metadata name that celld writes is spelled on this
+    /// backend.
+    ///
+    /// Azure Blob Storage requires a metadata name to be a C# identifier,
+    /// and it refuses the whole write with `400 InvalidMetadata` when a name
+    /// holds a hyphen. celld names such as `celld-r2` failed every R2 write
+    /// and lost every telemetry batch on an `az://` bucket
+    /// (denoland/celld#209). Azure therefore gets an underscore for each
+    /// hyphen, and [`BlobAttributes::metadata_value`] reads either spelling.
+    ///
+    /// The other backends keep the hyphen. An object that a fleet already
+    /// wrote carries the hyphenated name, and a proxy in front of an
+    /// S3-compatible store can drop a header name that holds an underscore
+    /// (nginx does by default). The LTX timestamp key makes the same
+    /// per-backend choice in `celld_ltx::TimestampMetadataKey`.
+    fn metadata_name(self, name: &str) -> Cow<'_, str> {
+        match self {
+            StorageBackend::Azure => Cow::Owned(name.replace('-', "_")),
+            StorageBackend::S3 | StorageBackend::Gcs | StorageBackend::Local => Cow::Borrowed(name),
         }
     }
 }
@@ -366,6 +393,8 @@ fn etag_eq(left: &str, right: &str) -> bool {
 /// `metadata` is the backend's user metadata, kept under its own
 /// `x-amz-meta-` / `x-goog-meta-` / `x-ms-meta-` prefix; what an R2
 /// binding puts in there is the binding's business, not this module's.
+/// The one thing this module decides is how a written name is spelled,
+/// because only this module knows which backend refuses which name.
 #[derive(Default, Clone)]
 pub struct BlobAttributes {
     pub content_type: Option<String>,
@@ -395,8 +424,9 @@ impl BlobAttributes {
         }
     }
 
-    /// The same, as the store's write-side attribute set.
-    fn write(&self) -> Attributes {
+    /// The same, as the store's write-side attribute set, with each
+    /// metadata name spelled for `backend`.
+    fn write(&self, backend: StorageBackend) -> Attributes {
         let mut attributes = Attributes::new();
         let mut set = |attribute: Attribute, value: &Option<String>| {
             if let Some(value) = value {
@@ -410,11 +440,28 @@ impl BlobAttributes {
         set(Attribute::CacheControl, &self.cache_control);
         for (name, value) in &self.metadata {
             attributes.insert(
-                Attribute::Metadata(Cow::Owned(name.clone())),
+                Attribute::Metadata(Cow::Owned(backend.metadata_name(name).into_owned())),
                 value.clone().into(),
             );
         }
         attributes
+    }
+
+    /// The value under a metadata name that celld writes, in whichever
+    /// spelling the backend stored. A store can fold the case of a name, so
+    /// case does not matter. Both spellings match on every backend, so an
+    /// object copied out of an Azure container into another store still
+    /// reads.
+    pub fn metadata_value(&self, name: &str) -> Option<&str> {
+        self.metadata
+            .iter()
+            .find(|(stored, _)| {
+                stored.len() == name.len()
+                    && stored.bytes().zip(name.bytes()).all(|(stored, wanted)| {
+                        stored.eq_ignore_ascii_case(&wanted) || (stored == b'_' && wanted == b'-')
+                    })
+            })
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -870,9 +917,10 @@ impl Bucket {
         Ok(())
     }
 
-    /// Size plus one user-metadata value (`x-amz-meta-*` / `x-goog-meta-*`),
-    /// or `None` when the key does not exist. A plain `head` cannot see
-    /// user metadata; this one can.
+    /// Size plus one user-metadata value (`x-amz-meta-*` / `x-goog-meta-*`
+    /// / `x-ms-meta-*`), or `None` when the key does not exist. A plain
+    /// `head` cannot see user metadata; this one can, under either spelling
+    /// of the name.
     pub async fn head_with_meta(
         &self,
         key: &str,
@@ -889,10 +937,9 @@ impl Bucket {
             .await
         {
             Ok(result) => {
-                let value = result
-                    .attributes
-                    .get(&Attribute::Metadata(name.to_string().into()))
-                    .map(|value| value.as_ref().to_string());
+                let value = BlobAttributes::read(&result.attributes)
+                    .metadata_value(name)
+                    .map(str::to_string);
                 Ok(Some((result.meta.size, value)))
             }
             Err(Error::NotFound { .. }) => Ok(None),
@@ -902,7 +949,8 @@ impl Bucket {
         }
     }
 
-    /// Plain write carrying user metadata (`x-amz-meta-*` / `x-goog-meta-*`).
+    /// Plain write carrying user metadata (`x-amz-meta-*` / `x-goog-meta-*`
+    /// / `x-ms-meta-*`), each name spelled for the backend.
     pub async fn put_with_meta(
         &self,
         key: &str,
@@ -910,15 +958,15 @@ impl Bucket {
         meta: &[(&'static str, &str)],
     ) -> anyhow::Result<()> {
         let key = self.key(key);
-        let mut attributes = Attributes::new();
-        for (name, value) in meta {
-            attributes.insert(
-                Attribute::Metadata(Cow::Borrowed(name)),
-                value.to_string().into(),
-            );
-        }
+        let attributes = BlobAttributes {
+            metadata: meta
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..BlobAttributes::default()
+        };
         let options = PutOptions {
-            attributes,
+            attributes: attributes.write(self.backend),
             ..PutOptions::default()
         };
         self.store
@@ -1068,7 +1116,11 @@ impl Bucket {
     ) -> anyhow::Result<ObjectPage> {
         // `PaginatedListStore` does not append the separator that
         // `ObjectStore::list` appends to a path-segment prefix.
-        let path = self.key(&format!("{}/", prefix.trim_end_matches('/')));
+        let path = if prefix.is_empty() {
+            self.key("")
+        } else {
+            self.key(&format!("{}/", prefix.trim_end_matches('/')))
+        };
         let mut result = self
             .paginated
             .list_paginated(
@@ -1327,7 +1379,7 @@ impl Bucket {
         let scoped = self.key(key);
         let options = PutOptions {
             mode,
-            attributes: attributes.write(),
+            attributes: attributes.write(self.backend),
             ..PutOptions::default()
         };
         match store
@@ -1402,13 +1454,13 @@ impl Bucket {
             let meta =
                 meta.with_context(|| format!("list {}://{}/{path}", self.scheme(), self.name))?;
             let key = self.unkey(meta.location.as_ref());
-            if !key.starts_with(prefix) {
+            let Some(remainder) = key.strip_prefix(prefix) else {
                 continue;
-            }
+            };
             let group = delimiter.and_then(|delimiter| {
-                key[prefix.len()..]
+                remainder
                     .find(delimiter)
-                    .map(|at| key[..prefix.len() + at + delimiter.len()].to_string())
+                    .map(|at| format!("{prefix}{}", &remainder[..at + delimiter.len()]))
             });
             // A prefix already rolled up costs nothing and does not end the
             // page: it is the same entry the caller has already been given.
@@ -1453,7 +1505,7 @@ impl Bucket {
     ) -> anyhow::Result<Box<dyn MultipartUpload>> {
         let key = self.key(key);
         let options = PutMultipartOptions {
-            attributes: attributes.write(),
+            attributes: attributes.write(self.backend),
             ..PutMultipartOptions::default()
         };
         self.store

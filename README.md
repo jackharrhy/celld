@@ -6,10 +6,10 @@ celld is an open-source daemon that runs a Cloudflare Workers application
 on your own machines: Workers, Durable Objects, KV, Queues, D1, R2,
 Workflows, Cron Triggers, and static assets, deployed from the
 `wrangler.json` that you already have. Each object is a cell: a named
-server with its own SQLite database. celld stores the long-term state in a bucket
-that you own — S3-compatible, Google Cloud Storage, or Azure Blob
-Storage — and needs no serving control plane and no consensus service.
-A cell that nothing is serving costs almost nothing. Learn more at
+server with its own SQLite database. celld stores the long-term state in
+your S3-compatible, Google Cloud Storage, or Azure Blob Storage bucket.
+It needs no serving control plane or consensus service.
+An inactive cell costs almost nothing. Learn more at
 [celld.dev](https://celld.dev) or read the
 [documentation](https://celld.dev/docs).
 
@@ -19,13 +19,12 @@ A node is one `celld` process, and you run one on each machine. Every
 node embeds V8 and executes Wrangler bundles. The nodes that share one
 bucket are a fleet, and that bucket holds the deployments, the cell
 state, and small ownership records. A conditional bucket write gives a node the
-ownership of a cell, so exactly one node owns a cell at a time — no
-membership protocol, no failure detector, no consensus service. Signed
+ownership of a cell, so exactly one node owns a cell at a time. The fleet
+needs no membership protocol, failure detector, or consensus service. Signed
 peer HTTP provides routing and replicated-log transport.
 
-celld captures each committed SQLite write as LTX data, the transaction
-format the replication uses. A single node proves the write durable by
-uploading that data to the bucket. A fleet of two or more nodes proves it
+celld captures each committed SQLite write in the LTX replication format.
+A single node proves the write durable by uploading that data to the bucket. A fleet of two or more nodes proves it
 sooner: the owner sends the data to one or two other nodes, and the write
 is durable as soon as they hold it on their disks. celld uploads the data
 to the bucket afterwards. A single node has no other node to send to, so
@@ -39,21 +38,25 @@ complete protocol.
 
 celld runs the programmatic Workers platform: the runtime, and each binding
 that Cloudflare builds on Workers and Durable Objects. A KV namespace, a
-queue, a D1 database, a Workflow, and the R2 index are each a cell, so
+queue, a D1 database, and a Workflow are each a cell, so
 they get the same lease, the same replication, and the same failover as a
-Durable Object. Each row links to a project that deploys as-is:
+Durable Object. R2 bindings read, write, and list objects directly in the
+fleet bucket. Each row links to a project that deploys as-is:
 
 | service | example |
 | --- | --- |
 | Workers: fetch handlers, service bindings, JS RPC, Node.js compat | [`hello`](examples/hello) |
 | Durable Objects: SQLite storage, alarms, hibernating WebSockets | [`counter`](examples/counter) |
 | KV: list, metadata, expiration, bulk import | [`kv`](examples/kv) |
-| Queues: producers, batching consumers, retries, dead letters | [docs](docs/cloudflare-compat.md#queues) |
+| Queues: producers, batching consumers, retries, dead letters | [`queues`](examples/queues) |
 | D1: SQL databases, batches, migrations | [`d1`](examples/d1) |
 | R2: reads, writes, lists, multipart uploads | [`r2`](examples/r2) |
 | Workflows: durable steps, sleeps, events, pause and restart | [`workflow`](examples/workflow) |
 | Cron Triggers: one run for each occurrence across the fleet | [`cron`](examples/cron) |
-| Static assets: asset-only or with a Worker, `_headers`, `_redirects` | [docs](docs/cloudflare-compat.md#static-assets) |
+| Static assets: asset-only or with a Worker, `_headers`, `_redirects` | [`static-assets`](examples/static-assets) |
+| Dynamic Workers: runtime-loaded code and Tail Worker observability | [`dynamic-worker-tails`](examples/dynamic-worker-tails) |
+| Containers (experimental): a Durable Object that supervises a container, `@cloudflare/containers` | [`container`](examples/container) |
+| Sandboxes: the Cloudflare Sandbox SDK, `@cloudflare/sandbox`, on a container per sandbox | [`sandbox`](examples/sandbox) |
 
 A product that needs the Cloudflare network, a GPU, or a browser farm is out
 of scope. The [Cloudflare compatibility](docs/cloudflare-compat.md) page
@@ -121,8 +124,8 @@ Run an application locally without a cloud bucket:
 celld dev
 ```
 
-The command starts one celld node and uses a local object store. It does not
-require Docker or a cloud bucket. The Worker listener uses
+The command starts one celld node with a local object store, so it needs
+no Docker or cloud bucket. The Worker listener uses
 `http://127.0.0.1:9876`. Use `celld dev --port PORT` to select a different
 Worker port. Use `celld dev --host IP` to select a different interface. A
 non-loopback IP exposes the Worker listener to the network, and the internal
@@ -211,11 +214,18 @@ celld --bucket az://my-cells-container --listen 0.0.0.0:8080 \
 A fleet runs one application, and every node loads its latest successfully
 committed deployment from `deploy/current.json`. `celld deploy` invokes
 `esbuild` from `PATH` for Worker code, accepts the supported Wrangler config
-subset — including co-deployed or asset-only static assets — and writes the
+subset (including co-deployed or asset-only static assets), and writes the
 deployment objects directly, using the documented types in
 `crates/celld/protocol.rs`. Every node discovers owners and peers from
 bucket leases; there is no account or join service. Run `celld --help` for
 the complete command line.
+
+An upgrade from v0.4.1 preserves the existing bucket and node data directories.
+Stop all old nodes, then start the new binaries with the same configuration.
+Startup upgrades the wake format automatically before a node serves traffic.
+Mixed versions cannot share a serving fleet.
+The [wake format contract](docs/guarantees.md#start-a-fleet-with-this-format)
+describes the startup checks and the boundary for existing fleet data.
 
 Peer HTTP and the operator API use the internal listener. Put every
 advertised address on a trusted private network or an encrypted overlay such
@@ -223,7 +233,7 @@ as WireGuard or Tailscale, and do not publish the internal port. celld
 rejects a literal public IP unless you supply `--unsafe-public-advertise`.
 An explicit advertised address requires an explicit internal-listener
 address, and you must route the advertised address to the internal
-listener — celld cannot verify a hostname or a translated port. The first
+listener, because celld cannot verify a hostname or a translated port. The first
 current node creates `fleet/peer-auth.json` in the bucket. Cell fetch and RPC
 requests carry a protocol version and depend on the trusted private network.
 Peer-control and reserved-cell operator requests use the fleet HMAC. This HMAC
@@ -281,6 +291,17 @@ celld kv bulk put sessions wrangler-export.json \
   --bucket s3://my-cells-bucket
 ```
 
+`celld r2` reads and writes the objects behind an `r2_buckets` binding. The
+command reads the fleet bucket directly, so it needs no running node and a
+release pipeline can publish an artifact before it deploys the Worker:
+
+```sh
+celld r2 put assets app.zip --path dist/app.zip \
+  --content-type application/zip \
+  --metadata '{"release":"1.2.3"}' \
+  --bucket s3://my-cells-bucket
+```
+
 `celld queue` inspects and controls a deployed Queue. A queue can continue to
 accept messages while delivery is paused:
 
@@ -317,7 +338,9 @@ greater of the allocator-adjusted RSS and the active cgroup working set. celld
 calculates the working set as `memory.current` less `inactive_file` from
 `memory.stat`, then it removes the measured allocator slack. This calculation
 includes active kernel charges that process RSS does not report, and it excludes
-file pages and allocator pages that celld cannot return by shedding a cell. The
+file pages and allocator pages that celld cannot return by shedding a cell.
+Before each sample, celld returns the memory that the C allocator keeps after
+a cell stops, so a hibernated cell does not hold its storage cache in RSS. The
 `/state` route reports all four input measurements.
 
 A separate absolute cap applies to the complete cgroup charge at 95% of the

@@ -5,9 +5,10 @@ for standalone applications. `fork.json` records the tested upstream revision,
 fork release version and Rust toolchain. [Radio](https://github.com/jackharrhy/radio)
 and [Worldview](https://github.com/jackharrhy/worldview) use this mode.
 
-The fork also carries two R2 compatibility repairs found by Radio's live-runtime
-tests: full reads omit the optional range record, and new R2 envelope metadata
-uses the Azure-safe `celld_r2` key while still reading the older `celld-r2` key.
+The fork retains the R2 full-read range repair found by Radio's live-runtime
+tests: full reads omit the optional range record. Upstream 0.5.1 supplies Azure
+metadata normalization; compatibility tests preserve reads of both `celld_r2`
+and `celld-r2` metadata from earlier fork releases.
 
 ## Consume a release
 
@@ -53,6 +54,44 @@ The store retains SQLite transactions for conditional writes and atomic object
 publication. Large objects use bounded chunks inside SQLite. Existing dev-store
 inline objects remain readable, but the new chunked format cannot be opened by
 older Celld builds. Preserve pre-upgrade backups when changing formats.
+
+## Upgrade from 0.4.1 to 0.5.1
+
+Release `0.5.1-jh.1` follows upstream `42269c121c989c65c0638ab01f368baf18a5f0df`.
+It retains the production SQLite backend, chunked object format, runtime lock,
+offline copy tool, SQLite 3.51.3 and reclaimable-cache admission policy. Upstream
+adds SQLite cache limits, C allocator trimming and recovery improvements. Memory
+admission also counts upstream's container reservations.
+
+This upgrade changes the engine's alarm-discovery format. Stop traffic, deploy
+writers and the old runtime/supervisor, wait for its leases to expire, and back
+up the complete stopped object store and node state before running the new
+binary. Preserve node names, addresses and replica directories. Deployment or
+startup upgrades the wake index automatically. A local migration takes the same
+exclusive guard as runtime startup and offline copying; ordinary deployments
+against an already-upgraded store remain possible while the runtime is online.
+
+Do not restart a 0.4.1 binary against upgraded storage. Rollback requires restoring
+the complete stopped pre-upgrade backup, losing subsequent writes unless saved
+separately. See upstream `docs/guarantees.md` for the migration protocol. An image
+rollback alone is insufficient.
+
+This release does not claim to fix all lease timeouts under storage stalls. The
+local store can wait up to 30 seconds on a SQLite writer, longer than the default
+10-second lease TTL; fencing remains enabled and must not be weakened to conceal
+an unhealthy storage path. Qualify application upgrades with the constrained
+1 GiB upload, old-state migration, empty-replica crash recovery and lease-contention
+checks in addition to the public Rust suites.
+
+## Runtime secrets
+
+For standalone deployments (SQLite and cloud buckets), this fork retains `CELLD_VAR_<NAME>` and
+`CELLD_VARS_FILE` overrides removed in upstream 0.5. Runtime environment values
+override file entries, which override manifest variables. These values are read
+when loading the trusted application and are not written into its deployment
+manifest or image. All Workers in that application share the existing trust
+boundary; this is not per-tenant secret isolation. Managed control-plane deployments reject these overrides. Other upstream removed-setting validation remains
+in place.
 
 ## Memory admission after large local writes
 

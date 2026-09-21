@@ -29,7 +29,7 @@ static RUNTIME_SERVICES: OnceLock<Mutex<HashMap<tokio::runtime::Id, Weak<HostSer
 static SELECT_STATE: OnceLock<AtomicU64> = OnceLock::new();
 
 thread_local! {
-    static SPAWNS: RefCell<Vec<(u64, OpFuture, OpLifetime)>> = const { RefCell::new(Vec::new()) };
+    static SPAWNS: RefCell<Vec<Spawn>> = const { RefCell::new(Vec::new()) };
 }
 
 struct ProductionDomain {
@@ -454,10 +454,22 @@ impl From<Vec<u8>> for OpOut {
 
 pub type OpFuture = Pin<Box<dyn Future<Output = Result<OpOut, String>> + Send>>;
 
-#[derive(Clone, Copy)]
-enum OpLifetime {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpLifetime {
     Handler,
     IoContext,
+    Unrefed,
+}
+
+/// One enqueued operation, waiting for a driver to take it.
+struct Spawn {
+    id: u64,
+    future: OpFuture,
+    lifetime: OpLifetime,
+    /// The `IoContext` of the continuation that enqueued it, when the op layer
+    /// could read one. `None` for work with no event behind it, which the
+    /// running turn owns as it always has.
+    owner: Option<u64>,
 }
 
 fn enqueue_with_lifetime<T: Into<OpOut>>(
@@ -468,8 +480,42 @@ fn enqueue_with_lifetime<T: Into<OpOut>>(
         .next_async_op
         .fetch_add(1, Ordering::Relaxed);
     let future: OpFuture = Box::pin(async move { future.await.map(Into::into) });
-    SPAWNS.with(|spawns| spawns.borrow_mut().push((id, future, lifetime)));
+    SPAWNS.with(|spawns| {
+        spawns.borrow_mut().push(Spawn {
+            id,
+            future,
+            lifetime,
+            owner: None,
+        })
+    });
     id
+}
+
+/// How many operations wait for the driver to take them.
+///
+/// The op layer reads this before and after one JavaScript op call, so it can
+/// name the event that enqueued an operation without paying for that lookup on
+/// every call that enqueues nothing.
+pub fn spawn_count() -> usize {
+    SPAWNS.with(|spawns| spawns.borrow().len())
+}
+
+/// Name the event that enqueued every operation added since `from`.
+///
+/// An operation belongs to its continuation's driver (its origin unless a
+/// critical section installs another driver), not necessarily the running
+/// turn: V8 runs a foreign continuation during another event's microtask
+/// checkpoint. Without this the running turn adopts the operation and cancels
+/// it when it retires, and the event that is really waiting never settles.
+pub fn attribute_spawns(from: usize, owner: u64) {
+    SPAWNS.with(|spawns| {
+        for spawn in spawns.borrow_mut().iter_mut().skip(from) {
+            // A native callback can invoke JS that enqueues under a nested
+            // continuation context. Its inner wrapper already named the
+            // driver; the outer wrapper must not overwrite that attribution.
+            spawn.owner.get_or_insert(owner);
+        }
+    });
 }
 
 /// Register an asynchronous operation. The request driver polls the operation.
@@ -486,12 +532,23 @@ pub(crate) fn enqueue_io_context<T: Into<OpOut>>(
     enqueue_with_lifetime(future, OpLifetime::IoContext)
 }
 
-pub fn drain_spawns() -> Vec<(u64, OpFuture, bool)> {
+/// Register an operation that runs with its event but cannot keep it alive.
+///
+/// A listener needs turns while the handler or `waitUntil` work is live, but
+/// an idle listener is not pending application work. The request driver drops
+/// this operation when no referenced work remains.
+pub(crate) fn enqueue_unrefed<T: Into<OpOut>>(
+    future: impl Future<Output = Result<T, String>> + Send + 'static,
+) -> u64 {
+    enqueue_with_lifetime(future, OpLifetime::Unrefed)
+}
+
+pub fn drain_spawns() -> Vec<(u64, OpFuture, OpLifetime, Option<u64>)> {
     SPAWNS.with(|spawns| {
         spawns
             .borrow_mut()
             .drain(..)
-            .map(|(id, future, lifetime)| (id, future, matches!(lifetime, OpLifetime::IoContext)))
+            .map(|spawn| (spawn.id, spawn.future, spawn.lifetime, spawn.owner))
             .collect()
     })
 }

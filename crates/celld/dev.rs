@@ -13,6 +13,7 @@ use glob::{MatchOptions, Pattern};
 use notify::{RecursiveMode, Watcher as _};
 use nu_ansi_term::{Color, Style};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::io::IsTerminal as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -338,6 +339,8 @@ directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
+A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
+as for wrangler dev. Its entries override the vars of the config.\n\n\
 OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
@@ -478,6 +481,36 @@ async fn open_store(state: &Path, console: &Console) -> anyhow::Result<Store> {
     Ok(Store { database })
 }
 
+/// The Worker variables of `.dev.vars` beside the config, in the dotenv form
+/// `wrangler dev` reads. They override the `vars` of the config. Only
+/// `celld dev` reads the file, so a local credential cannot reach a fleet.
+#[allow(clippy::disallowed_methods)] // The project is on the operator's host filesystem.
+fn read_dev_vars(config: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    let path = config.with_file_name(".dev.vars");
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    Ok(contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.trim(), value.trim()))
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(name, value)| {
+            // One matched pair of quotes comes off; a lone quote is part of
+            // the value, as in dotenv, so a secret that ends in one survives.
+            let value = ['"', '\'']
+                .into_iter()
+                .find_map(|quote| value.strip_prefix(quote)?.strip_suffix(quote))
+                .unwrap_or(value);
+            (name.to_string(), value.to_string())
+        })
+        .collect())
+}
+
 async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Result<()> {
     let bucket = open_local_bucket(&store.database)?;
     let built = deploy::build(&deploy::Options {
@@ -487,10 +520,13 @@ async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Res
         region: None,
         dry_run: false,
         json: false,
+        vars: read_dev_vars(config)?,
+        local_images: true,
     })?;
     if logs {
         built.report();
     }
+    crate::wake_format::ensure_ready(&bucket).await?;
     deploy::write(&bucket, &built).await
 }
 
@@ -597,7 +633,6 @@ async fn start_node(
         "CELLD_BUCKET",
         "CELLD_CLOUD",
         "CELLD_INTERNAL_ADDR",
-        "CELLD_STORAGE_PROBE",
         "CELLD_TEST_BUCKET",
         "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",

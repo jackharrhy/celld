@@ -1,7 +1,7 @@
 // EventSource over the streaming fetch path, following Workerd
 // (src/workerd/api/eventsource.c++): same reconnection ladder (2 s
 // default retry clamped to [1 s, 10 s], one no-body response retries and
-// a second fails), same header set, and the same parser — a message's
+// a second fails), same header set, and the same parser -- a message's
 // data lines join with "\n", an empty joined data dispatches nothing,
 // and `id:` persists as the Last-Event-ID for reconnects.
 (function () {

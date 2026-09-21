@@ -48,6 +48,10 @@ pub struct ActivitySnapshot {
     /// Balancing moves no peer acquired. A subset of `handoff_failed`; the
     /// cell stayed unowned and its next request re-reads ownership.
     pub rebalance_failed: u64,
+    /// Cached owner or capacity routes retired after an observed lease
+    /// deadline. Counts one per retirement, including healthy renewals;
+    /// lease-less adoption replies and explicit invalidations do not count.
+    pub remote_route_refreshes: u64,
 }
 
 /// Management-facing lifecycle state derived atomically from [`State`].
@@ -233,6 +237,26 @@ pub struct CapacityPeer {
     pub draining: bool,
 }
 
+impl CapacityPeer {
+    /// Whether this peer's own load report leaves room for another cell.
+    ///
+    /// The rebalance planner and the handoff executor must return the same
+    /// answer here, so both read this one predicate. The planner counts a
+    /// peer's room before it releases a batch, and the executor offers each
+    /// released cell only to a peer that has room. A peer the planner counts
+    /// and the executor then refuses leaves the cell unowned with its epoch
+    /// retained, because the release CAS runs before the successor acquire
+    /// and nothing puts the record back.
+    ///
+    /// A saturated ingress-only node is the case that breaks a split rule.
+    /// It owns no cells, so it looks like the emptiest receiver in the
+    /// fleet and the planner gives it the largest room, while the executor
+    /// refuses every cell it is offered.
+    pub fn reports_adoption_capacity(&self) -> bool {
+        !self.pressured && self.memory_headroom != Some(false)
+    }
+}
+
 /// A successor that has acquired a released cell.
 ///
 /// The executor obtains this only from a signed peer acknowledgement. The
@@ -409,6 +433,10 @@ pub enum Channel {
     Service,
     /// A call to another cell: its `fetch` or one of its RPC methods.
     CellRpc,
+    /// An operation that changes an application R2 bucket.
+    R2,
+    /// A connection, write, TLS upgrade, or shutdown on a raw TCP socket.
+    Tcp,
     /// A leased Queue batch leaving its broker for a consumer Worker.
     Queue,
     /// The promise `storage.sync()` returns to the handler. Nothing leaves
@@ -431,6 +459,8 @@ impl Channel {
             Channel::WsSelf => "ws_self",
             Channel::Service => "service",
             Channel::CellRpc => "cellrpc",
+            Channel::R2 => "r2",
+            Channel::Tcp => "tcp",
             Channel::Queue => "queue",
             Channel::Sync => "sync",
         }
@@ -676,7 +706,7 @@ pub enum Event {
     },
     AlarmObserved {
         cell: CellId,
-        at_ms: Option<i64>,
+        alarm: wake::AlarmSnapshot,
         covered: bool,
         now_ms: u64,
         now_mono_ms: u64,
@@ -696,7 +726,7 @@ pub enum Event {
         /// covers it, and the position of the consuming commit if the firing
         /// wrote. The position is sampled last, so it covers the consume
         /// itself, and the core proves it durable before the alarm settles.
-        result: Result<(Option<i64>, bool, Option<u64>), Failure>,
+        result: Result<(wake::AlarmSnapshot, bool, Option<u64>), Failure>,
     },
     /// A due wake entry was found for `cell`. `entry_ms` is the minute the
     /// entry is filed under, so the node that acts on the hint can adopt
@@ -796,16 +826,29 @@ pub enum Event {
     RuntimeStopped {
         op: OpId,
     },
-    /// A bounded stop did not complete before its deadline. The runtime is
+    /// A stop returned an error after its retry deadline. The runtime is
     /// gone, the database stays open, and the cell restarts on it at the
-    /// same epoch, as a generation swap does.
+    /// same epoch, as a generation swap does. A pending stop emits no result.
     RuntimeStopFailed {
         op: OpId,
     },
-    /// Policy input for this first slice. Later eviction selection emits this
-    /// from the same core rather than an external caller choosing a victim.
+    /// The host rescued the database for new activity instead of completing
+    /// the eviction. The runtime restarts through the failed-stop path.
+    RuntimeStopCancelled {
+        op: OpId,
+    },
+    /// Attempt a policy eviction without a caller result. Deterministic
+    /// policy drivers use this input; the Actor uses `EvictRequested` so a
+    /// refusal or an interrupted operation cannot look like success.
     Evict {
         cell: CellId,
+    },
+    /// Try an explicit eviction now and report admission before its effects
+    /// run, so the executor can bind the caller to the accepted operation.
+    EvictRequested {
+        request: RequestId,
+        cell: CellId,
+        now_mono_ms: u64,
     },
     /// A periodic resource sample from the edge.
     ///
@@ -856,10 +899,6 @@ pub enum Route {
 pub struct WorkerRoute {
     pub cell: CellId,
     pub epoch: Epoch,
-    /// A pending durability proof made stale by selecting this still-routable
-    /// resident. The executor uses the ID only to release its effect waiter;
-    /// a late completion is ignored by the core's phase check.
-    pub retired_durability: Option<OpId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -878,10 +917,113 @@ pub enum RequestError {
     DurabilityUnproven,
 }
 
+/// A successful local eviction request. A later request can reactivate the cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictSuccess {
+    /// The awaited eviction completes its runtime stop, including for joined callers.
+    Evicted,
+    /// The Actor finds settled local absence without a pending lifecycle transition.
+    AlreadyAbsent,
+}
+
+/// An eviction refused before an operation starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictRefusal {
+    NodeUnavailable,
+    CellActive,
+    CellTransitioning,
+    AlarmImminent,
+    AlarmUncovered,
+    ConcurrencyLimit,
+}
+
+/// An accepted eviction interrupted by a later lifecycle decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictCancellation {
+    Activity,
+    Alarm,
+    NodeFenced,
+}
+
+/// An eviction whose completion could not be established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictFailure {
+    Durability,
+    DurabilityTimeout,
+    RuntimeStop,
+    ActorUnavailable,
+    ReplyLost,
+}
+
+/// Refusal and cancellation are expected outcomes, not node malfunctions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictError {
+    Refused(EvictRefusal),
+    Cancelled(EvictCancellation),
+    Failed(EvictFailure),
+}
+
+impl EvictError {
+    /// Stable category shared by Rust diagnostics and HTTP responses.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Refused(_) => "refused",
+            Self::Cancelled(_) => "cancelled",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// Stable reason code. Debug output cannot define the wire contract,
+    /// because a Rust variant rename must not change operator clients.
+    pub const fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused(EvictRefusal::NodeUnavailable) => "node_unavailable",
+            Self::Refused(EvictRefusal::CellActive) => "cell_active",
+            Self::Refused(EvictRefusal::CellTransitioning) => "cell_transitioning",
+            Self::Refused(EvictRefusal::AlarmImminent) => "alarm_imminent",
+            Self::Refused(EvictRefusal::AlarmUncovered) => "alarm_uncovered",
+            Self::Refused(EvictRefusal::ConcurrencyLimit) => "eviction_limit",
+            Self::Cancelled(EvictCancellation::Activity) => "new_activity",
+            Self::Cancelled(EvictCancellation::Alarm) => "alarm_activity",
+            Self::Cancelled(EvictCancellation::NodeFenced) => "node_fenced",
+            Self::Failed(EvictFailure::Durability) => "durability_failed",
+            Self::Failed(EvictFailure::DurabilityTimeout) => "durability_timeout",
+            Self::Failed(EvictFailure::RuntimeStop) => "runtime_stop_failed",
+            Self::Failed(EvictFailure::ActorUnavailable) => "actor_unavailable",
+            Self::Failed(EvictFailure::ReplyLost) => "reply_lost",
+        }
+    }
+}
+
+impl std::fmt::Display for EvictError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.kind(), self.reason())
+    }
+}
+
+impl std::error::Error for EvictError {}
+
+/// Admission of an explicit caller. The core keeps its operation binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvictionAdmission {
+    Absent,
+    Pending,
+}
+
 /// Work performed outside the core. Every asynchronous effect is versioned;
 /// completion events with an obsolete `op` are ignored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
+    EvictionAdmission {
+        request: RequestId,
+        result: Result<EvictionAdmission, EvictError>,
+    },
+    /// Settle a caller bound to the completed operation. A later activation
+    /// or eviction of the same cell cannot change this result.
+    EvictionFinished {
+        request: RequestId,
+        result: Result<EvictSuccess, EvictError>,
+    },
     ScheduleTimer {
         timer: Timer,
         at_mono_ms: u64,
@@ -939,20 +1081,11 @@ pub enum Effect {
     /// Emitted wherever the alarm settles, which is the only place that
     /// knows. An arm needs an entry; a consumed alarm needs its entry gone,
     /// or every later due scan finds a hint for an alarm that already fired
-    /// and wakes a cell with nothing to do. `next_alarm_ms` is -1 when no
-    /// alarm remains.
+    /// and wakes a cell with nothing to do. The snapshot retains its source
+    /// revision through the proof that permits this effect.
     ReconcileWakeEntry {
         cell: CellId,
-        next_alarm_ms: i64,
-    },
-    /// Take responsibility for the wake entry a hint came from, filed under
-    /// `entry_ms`. Emitted only when the core acts on the hint: the node that
-    /// activates the cell must know the entry so its consume deletes it, and
-    /// a node that does not act must not learn about a cell it never
-    /// resolves, or the fleet's whole due set accumulates in its flusher.
-    AdoptWakeEntry {
-        cell: CellId,
-        entry_ms: i64,
+        alarm: wake::AlarmSnapshot,
     },
     /// Publish an evicted cell as unowned, keeping its epoch, so the next
     /// node to want it can take it without waiting for this one to notice.
@@ -1012,6 +1145,24 @@ pub enum Effect {
         op: OpId,
         cell: CellId,
         epoch: Epoch,
+        /// Whether a request that arrives during this proof puts the cell back
+        /// into service instead of waiting for a successor. The cell still
+        /// serves while the proof runs, so an arriving request can cancel the
+        /// eviction. A revocable proof is therefore the last point at which
+        /// the node can change its mind, so the shell finishes every remote
+        /// check it needs here rather than after it takes close exclusion. A
+        /// drain has nowhere to put the cell back, so it pays for no check it
+        /// does not need.
+        ///
+        /// The two cancel sites do not test the same thing, which is worth
+        /// knowing before either one changes. `request_authorized` refuses to
+        /// rescue a cell while the node drains. `worker_request` cancels an
+        /// `EnsuringDurability` eviction with no drain test at all. That
+        /// asymmetry is safe only because a drain sets this field false: the
+        /// shell then does no revocable work, so a rescue costs a cancelled
+        /// proof and nothing more, and `LtxRepl::evict` remains the final
+        /// authority on whether the cell may be given up.
+        revocable: bool,
     },
     /// The output gate: prove the cell's committed `position` is replicated so
     /// a withheld local write response can be released. Unlike
@@ -1037,11 +1188,30 @@ pub enum Effect {
         cell: CellId,
         epoch: Epoch,
         cause: StopCause,
-        /// The shell gives up after its operation deadline and reports
-        /// `RuntimeStopFailed`. A drain and a fence retry until the process
-        /// ends, because their node is leaving; an eviction on a serving
-        /// node is not worth a cell that never answers again.
+        /// After a returned error, the shell stops retrying at its deadline
+        /// and reports `RuntimeStopFailed`. An in-flight release has no
+        /// timeout. A drain and a fence keep retrying returned errors until
+        /// the process ends, because their node is leaving.
         bounded: bool,
+    },
+    /// Give the cell back instead of finishing this eviction stop.
+    ///
+    /// A request is waiting on a cell in `Phase::Cleaning`, and the stop that
+    /// holds it is a bounded eviction, so the node has somewhere to put the
+    /// cell back. The shell abandons the stop if it can still do so, and it
+    /// reports `RuntimeStopCancelled`, which restarts the cell on its open
+    /// database at the epoch it already had.
+    ///
+    /// The shell decides whether it is still able to. An eviction that has
+    /// made its handoff snapshot visible cannot be abandoned: the snapshot is
+    /// a full image at one txid and it is the successor's restore artifact, so
+    /// a cell that served past it would leave a later restore reading a
+    /// complete database that stops short of an acknowledged write. This
+    /// effect is therefore a request and not an instruction, and a stop that
+    /// declines it reports `RuntimeStopped` as before.
+    AbandonEvictionStop {
+        op: OpId,
+        cell: CellId,
     },
     FireAlarm {
         op: OpId,

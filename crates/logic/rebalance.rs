@@ -29,11 +29,16 @@ impl Member<'_> {
     /// activations queued behind its ceiling would time the adoption out
     /// behind them: an adoption is a record read and a CAS through that
     /// same queue, and on the 2026-09-04 fleet a node that had just
-    /// returned, waking nine hundred rooms, let a batch of 21 time out. The
-    /// plan and the executor share this rule, so a donor never releases a
-    /// cell it has nowhere to put.
+    /// returned, waking nine hundred rooms, let a batch of 21 time out.
+    ///
+    /// A memory-saturated node is excluded through the same predicate the
+    /// executor ranks candidates with, so the plan and the executor share
+    /// this rule and a donor never releases a cell it has nowhere to put.
     fn receives_from(&self, self_node: &str) -> bool {
-        self.peer.node != self_node && !self.peer.draining && self.peer.restoring == 0
+        self.peer.node != self_node
+            && !self.peer.draining
+            && self.peer.restoring == 0
+            && self.peer.reports_adoption_capacity()
     }
 
     /// Owned cells per unit of weight, compared without division. The node

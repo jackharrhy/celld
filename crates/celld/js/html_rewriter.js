@@ -3,7 +3,7 @@
 // The host parks the parser while JS services each content token, so a
 // handler can be async and its mutations apply to the live token with
 // lol_html's own validation errors. Content tokens are only valid
-// during their handler — afterwards every member throws, as Workerd's
+// during their handler -- afterwards every member throws, as Workerd's
 // do. Stream-valued content (a ReadableStream or Response passed to
 // before/replace/...) is buffered after the handler settles and then
 // applied, which keeps output order without pausing the parser twice.

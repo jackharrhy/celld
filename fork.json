@@ -1,6 +1,6 @@
 {
-  "version": "0.4.1-jh.2",
+  "version": "0.5.1-jh.1",
   "upstream": "https://github.com/denoland/celld",
-  "upstreamRevision": "10cb1303dac710dcb3b557e318e08c855261f68b",
+  "upstreamRevision": "42269c121c989c65c0638ab01f368baf18a5f0df",
   "rustVersion": "1.94.1"
 }

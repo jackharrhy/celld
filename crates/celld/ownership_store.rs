@@ -45,16 +45,10 @@ pub(crate) struct NodeLeaseWire {
     /// records readable during a mixed-version rollout.
     #[serde(default)]
     pub(crate) paced_handoff: bool,
-    /// The process generation. In production this IS `probe_public_key`,
-    /// published twice under two names. Part 1 (this release) reads the
-    /// probe key when the old field is absent, see `NodeLeaseWireRaw`.
-    /// Part 2, after 2026-10-01: stop writing this field, publish only
-    /// `probe_public_key`, and derive the generation from it everywhere,
-    /// which needs the probe signer to draw from the simulation-aware RNG
-    /// so the deterministic worlds keep their replay, and the private
-    /// fixtures that plant `ownership_index_generation` to plant
-    /// `probe_public_key` instead. The reader fallback stays; it becomes
-    /// the only path.
+    /// The process generation has the same value as `probe_public_key` in
+    /// production. Keep writing both names while older nodes read this one.
+    /// `NodeLeaseWireRaw` reads the probe key when this field is absent, so
+    /// a later format can omit the duplicate after mixed-version support ends.
     #[serde(default, rename = "ownership_index_generation")]
     pub(crate) generation: String,
     /// The folded node log: absent until the
@@ -70,6 +64,31 @@ pub(crate) struct NodeLeaseWire {
 // namespace. Neither a cached lease nor the refresh claim grants authority.
 const CAPACITY_SAMPLE_KEY: &str = "fleet/capacity-v1.json";
 const CAPACITY_REFRESH_TIMEOUT_MS: u64 = 30_000;
+
+/// How many sample intervals a reader still accepts the displaced sample
+/// for while a refresh claim stands. `read_or_claim_capacity_sample` applies
+/// it to the previous sample, and `capacity_claim_ms` to the claim itself.
+const CAPACITY_PREVIOUS_INTERVALS: u64 = 3;
+
+/// How long one refresh claim can stand before another node takes it over.
+///
+/// A reader that meets a standing claim answers from the sample the claim
+/// displaces, and refuses that sample after `CAPACITY_PREVIOUS_INTERVALS`
+/// intervals. A claim that outlives its own displaced sample therefore
+/// leaves every other node with nothing at all. A refresher that dies inside
+/// its claim never releases it, so under the flat timeout alone the whole
+/// fleet lost the sample for 30 s: its format gate closed and its balancing
+/// stopped, and on 2026-09-07 a rolling update's first takeover after the
+/// old release expired cloned a whale that had to page. Bind the claim to
+/// the interval the displaced sample already covers, and a dead refresher
+/// costs no more than the reader's own tolerance. The flat timeout stays as
+/// the ceiling for a fleet whose interval is minutes; a scan that outlasts
+/// this bound produces a sample every reader would have refused anyway.
+fn capacity_claim_ms(sample_ms: u64) -> u64 {
+    sample_ms
+        .saturating_mul(CAPACITY_PREVIOUS_INTERVALS)
+        .min(CAPACITY_REFRESH_TIMEOUT_MS)
+}
 
 /// One fleet scan. The lease bodies are kept as the refresher read them,
 /// uninterpreted, so the refresher's release never mediates a peer's record:
@@ -278,6 +297,12 @@ pub struct NodeLoadWire {
     /// The node is draining. `None` from a node that predates the field.
     #[serde(default)]
     pub draining: Option<bool>,
+    /// The running containers this node holds, per class. Peers sum this
+    /// across the fleet sample to enforce a class's `max_instances`. Absent
+    /// from a node with no running container, and from one that predates the
+    /// field, both of which read as no containers.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub container_instances: std::collections::BTreeMap<String, u64>,
 }
 
 #[cfg(all(test, celld_internal_tests))]
@@ -734,9 +759,15 @@ impl BucketOwnership {
                 // a stalled refresher cannot keep granting format permission
                 // from an old membership. On the 2026-09-05 fleet a
                 // two-interval bound failed about one tick a minute on the
-                // nodes that never won the claim.
+                // nodes that never won the claim. `capacity_claim_ms` retires
+                // the claim at the same bound, so a reader that refuses this
+                // sample can take the claim over instead of waiting.
                 return match previous {
-                    Some(sample) if sample.age_ms(now).is_some_and(|age| age < 3 * sample_ms) => {
+                    Some(sample)
+                        if sample
+                            .age_ms(now)
+                            .is_some_and(|age| age < CAPACITY_PREVIOUS_INTERVALS * sample_ms) =>
+                    {
                         sample.taken().map(Some)
                     }
                     _ => anyhow::bail!("the fleet sample is being refreshed"),
@@ -748,7 +779,7 @@ impl BucketOwnership {
             }
             None => (None, None),
         };
-        let expires_ms = now.saturating_add(CAPACITY_REFRESH_TIMEOUT_MS);
+        let expires_ms = now.saturating_add(capacity_claim_ms(sample_ms));
         let claim = CapacitySampleWire::Refreshing {
             expires_ms,
             previous: previous.clone(),
@@ -772,7 +803,25 @@ impl BucketOwnership {
         // Stamp before the listing, not after the GETs: slow I/O must not
         // turn an old membership view into a newly fresh format permission.
         let started_ms = now_ms();
-        let leases = match self.read_capacity_lease_bodies().await {
+        // An empty scan is a lost fleet, never an empty one. The refresher is
+        // itself a live member, so its own record is always there to read, and
+        // a scan that returns nothing means the listing did not answer for the
+        // prefix rather than that the fleet has no nodes. Published as a fresh
+        // sample the empty result is worse than no sample at all: every reader
+        // believes it for a whole interval, a node at its residency cap finds
+        // no peer with room, and it sheds a live resident for a placement a
+        // peer would have taken -- which leaves that cell unowned with its
+        // epoch retained. Fail the refresh instead, which restores the
+        // previous sample under the claim and makes the next reader scan
+        // again at once.
+        let scan = self.read_capacity_lease_bodies().await.and_then(|leases| {
+            anyhow::ensure!(
+                !leases.is_empty(),
+                "the fleet sample scan found no live node lease",
+            );
+            Ok(leases)
+        });
+        let leases = match scan {
             Ok(leases) => leases,
             Err(error) => {
                 // Give the previous sample back under the claim. The next
@@ -961,6 +1010,7 @@ impl BucketOwnership {
                 restoring: self.live.restoring.load(Ordering::Relaxed),
                 rebalance_paused: Some(self.live.rebalance_paused.load(Ordering::Relaxed)),
                 draining: Some(self.live.draining.load(Ordering::Relaxed)),
+                container_instances: Default::default(),
             };
         }
         #[cfg(all(test, celld_internal_tests))]
@@ -1090,6 +1140,37 @@ pub(crate) async fn load_node_lease(
         }))
 }
 
+/// The running containers of `class` on every fleet node except
+/// `exclude_node`, summed from the shared capacity sample. The caller adds
+/// its own live count, which the sample may not carry yet, so a node always
+/// sees its own containers. One read of the sample, no per-node fetch: the
+/// sample already holds every lease body. Best effort, and at most one
+/// refresh interval stale, so two nodes starting the same class at once can
+/// briefly exceed `max_instances` and converge on the next refresh, which
+/// the container design accepts. A missing or unreadable sample counts no
+/// peers.
+pub async fn fleet_class_instances(bucket: &Bucket, class: &str, exclude_node: &str) -> u64 {
+    let sample = match load_json::<CapacitySampleWire>(bucket, CAPACITY_SAMPLE_KEY).await {
+        Ok(Some((CapacitySampleWire::Ready(sample), _))) => sample,
+        // A reader inside a refresh window counts the displaced sample.
+        Ok(Some((
+            CapacitySampleWire::Refreshing {
+                previous: Some(previous),
+                ..
+            },
+            _,
+        ))) => previous,
+        _ => return 0,
+    };
+    sample
+        .leases
+        .iter()
+        .filter_map(|lease| serde_json::from_str::<NodeLeaseWire>(lease.get()).ok())
+        .filter(|lease| lease.node != exclude_node)
+        .filter_map(|lease| lease.load.container_instances.get(class).copied())
+        .sum()
+}
+
 async fn load_json<T: for<'de> Deserialize<'de>>(
     bucket: &Bucket,
     key: &str,
@@ -1175,5 +1256,8 @@ pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
         restoring: live.restoring.load(Ordering::Relaxed),
         rebalance_paused: Some(live.rebalance_paused.load(Ordering::Relaxed)),
         draining: Some(live.draining.load(Ordering::Relaxed)),
+        // Published each renewal, so a peer sees a start or stop within a
+        // renewal and a sample refresh. Empty on a node with no engine.
+        container_instances: crate::container::running_instances_by_class(),
     }
 }

@@ -48,3 +48,4 @@ crc-fast.workspace = true
 ureq = "3.4.0"
 http = "1"
 percent-encoding = "2"
+tempfile.workspace = true

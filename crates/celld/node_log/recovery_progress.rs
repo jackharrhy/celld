@@ -117,7 +117,14 @@ impl Progress {
     /// Called only after all uploads for this cell epoch complete, or a
     /// coverage lookup proves they were already durable. An interrupted cell
     /// never contributes a hint, even if some of its PUTs reached the bucket.
+    /// The in-memory watermark serves this process's next gather window;
+    /// the checkpoint serves a successor process.
     pub async fn completed(&mut self, bucket: &Bucket, cell: CoveredCell) {
+        let through = self
+            .covered
+            .entry((cell.cell.clone(), cell.epoch))
+            .or_default();
+        *through = (*through).max(cell.through);
         if !self.writable {
             return;
         }

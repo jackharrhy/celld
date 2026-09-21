@@ -45,30 +45,25 @@ async fn dispatch_ws_message(
         // that followed would otherwise trail nothing and reveal it (#715).
         // The frames it captured before it failed are dropped, as before.
         Err(error) => {
-            if app.output_gate {
-                if let Some(position) = celld::js::failed_write_position(&error) {
-                    // The barrier is registered before the activity guard
-                    // drops: the core reads the still-pinned request when it
-                    // opens the barrier, and a guard dropped first would let
-                    // the cell be released under an unregistered write.
-                    if let Err(stopped) = app
-                        .ws_output(request, scope.to_string(), Vec::new(), Some(position), None)
-                        .await
-                    {
-                        tracing::warn!(scope, position, %stopped, "no barrier for a failed webSocketMessage handler's write");
-                    }
+            if let Some(position) = celld::js::failed_write_position(&error) {
+                // The barrier is registered before the activity guard
+                // drops: the core reads the still-pinned request when it
+                // opens the barrier, and a guard dropped first would let
+                // the cell be released under an unregistered write.
+                if let Err(stopped) = app
+                    .ws_output(request, scope.to_string(), Vec::new(), Some(position), None)
+                    .await
+                {
+                    tracing::warn!(scope, position, %stopped, "no barrier for a failed webSocketMessage handler's write");
                 }
             }
             drop(activity);
             return Err(error);
         }
     };
-    // The gate captured the handler's outbound frames. With the gate armed, hand
-    // them to the cell's barrier queue; else flush them as the handler produced
-    // them. Either way the frames only reach a socket from here.
-    if !app.output_gate {
-        celld::js::ws_emit_batch(dispatch.frames);
-    } else if !dispatch.frames.is_empty() || dispatch.write_position.is_some() {
+    // A read-only frame can reveal another event's unproven write, so all
+    // captured frames pass through the cell's barrier queue before emission.
+    if !dispatch.frames.is_empty() || dispatch.write_position.is_some() {
         if let Err(stopped) = app
             .ws_output(
                 request,
@@ -127,7 +122,7 @@ async fn gate_lifecycle_write(
         Ok(position) => *position,
         Err(error) => celld::js::failed_write_position(error),
     };
-    if let (true, Some(position)) = (app.output_gate, position) {
+    if let Some(position) = position {
         tracing::debug!(
             scope,
             position,

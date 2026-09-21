@@ -46,3 +46,95 @@ pub fn websocket_echo_close(
         Some(peer_code)
     }
 }
+
+/// Track frame boundaries in the unmasked stream from a WebSocket owner.
+///
+/// A byte-splicing hop can append a failure Close only between frames and
+/// before any owner Close. Otherwise a second Close fails browser channels,
+/// or the injected bytes become part of an incomplete frame's payload.
+/// Payloads are skipped without buffering; this is not a protocol validator.
+#[derive(Debug, Default)]
+pub struct WebSocketCloseScanner {
+    state: WebSocketScanState,
+}
+
+#[derive(Debug, Default)]
+enum WebSocketScanState {
+    #[default]
+    Opcode,
+    Length,
+    ExtendedLength {
+        remaining: u8,
+        value: u64,
+    },
+    Payload {
+        remaining: u64,
+    },
+    // A Close has started, or a masked/invalid-length owner frame makes
+    // appending a server frame unsafe. Never resume scanning this stream.
+    Stopped,
+}
+
+impl WebSocketCloseScanner {
+    /// Observe bytes successfully written to the client, in stream order.
+    pub fn observe(&mut self, mut bytes: &[u8]) {
+        use WebSocketScanState::*;
+        while let Some((&byte, rest)) = bytes.split_first() {
+            match &mut self.state {
+                Opcode => {
+                    self.state = if byte & 0x0f == 8 { Stopped } else { Length };
+                }
+                Length => {
+                    self.state = match byte {
+                        0 => Opcode,
+                        1..=125 => Payload {
+                            remaining: u64::from(byte),
+                        },
+                        126 => ExtendedLength {
+                            remaining: 2,
+                            value: 0,
+                        },
+                        127 => ExtendedLength {
+                            remaining: 8,
+                            value: 0,
+                        },
+                        // A server must not mask its frames.
+                        _ => Stopped,
+                    };
+                }
+                ExtendedLength { remaining, value } => {
+                    // RFC 6455 limits extended lengths to 63 bits.
+                    if *remaining == 8 && byte & 0x80 != 0 {
+                        self.state = Stopped;
+                    } else {
+                        *value = (*value << 8) | u64::from(byte);
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            self.state = if *value == 0 {
+                                Opcode
+                            } else {
+                                Payload { remaining: *value }
+                            };
+                        }
+                    }
+                }
+                Payload { remaining } => {
+                    let count = (*remaining).min(bytes.len() as u64) as usize;
+                    *remaining -= count as u64;
+                    bytes = &bytes[count..];
+                    if *remaining == 0 {
+                        self.state = Opcode;
+                    }
+                    continue;
+                }
+                Stopped => return,
+            }
+            bytes = rest;
+        }
+    }
+
+    /// Whether the stream can accept a synthetic Close at its current end.
+    pub fn can_append_close(&self) -> bool {
+        matches!(self.state, WebSocketScanState::Opcode)
+    }
+}

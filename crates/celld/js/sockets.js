@@ -1,4 +1,4 @@
-// `cloudflare:sockets` — outbound TCP over the __tcp_* host ops,
+// `cloudflare:sockets` -- outbound TCP over the __tcp_* host ops,
 // following Workerd (src/workerd/api/sockets.c++): the same address
 // parsing (a URL parse behind a fake scheme, so IPv6 works), the same
 // validation messages, EOF closing the write side unless allowHalfOpen,
@@ -86,7 +86,7 @@
       // highWaterMark 0: the stream must never read ahead of the
       // consumer. A speculative host read parked on the connection
       // would deadlock startTls(), whose handshake cannot begin while
-      // a plaintext read holds the socket — the server speaks second.
+      // a plaintext read holds the socket -- the server speaks second.
       this._readable = new ReadableStream({
         async pull(controller) {
           await socket._opened;
@@ -227,5 +227,5 @@
     );
   };
 
-  globalThis.__cfSockets = { connect };
+  __celld.__cfSockets = { connect };
 })();

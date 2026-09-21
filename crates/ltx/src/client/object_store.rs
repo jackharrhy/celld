@@ -556,8 +556,8 @@ fn match_filebase(host: &str) -> Option<String> {
 /// s3/replica_client.go:322-477), so construction is infallible and race-free.
 pub struct ObjectStoreClient {
     store: tokio::sync::OnceCell<Arc<dyn ObjectStore>>,
-    /// The concrete store when this client built its own; `with_store`
-    /// leaves it empty, and the paged reader is then unavailable.
+    /// The config's S3 store, initialized for replica I/O or when a shared
+    /// store's paged reader needs an ambient credential provider.
     s3: tokio::sync::OnceCell<Arc<AmazonS3>>,
     config: ObjectStoreConfig,
 }
@@ -596,11 +596,13 @@ impl ObjectStoreClient {
     /// Get-or-build the inner store, once.
     async fn store(&self) -> Result<&Arc<dyn ObjectStore>> {
         self.store
-            .get_or_try_init(|| async {
-                let s3 = self.config.build_s3()?;
-                self.s3.set(s3.clone()).ok();
-                Ok(s3 as Arc<dyn ObjectStore>)
-            })
+            .get_or_try_init(|| async { Ok(self.s3().await?.clone() as Arc<dyn ObjectStore>) })
+            .await
+    }
+
+    async fn s3(&self) -> Result<&Arc<AmazonS3>> {
+        self.s3
+            .get_or_try_init(|| async { self.config.build_s3() })
             .await
     }
 
@@ -620,11 +622,6 @@ impl ObjectStoreClient {
                 config.path.clone(),
             )));
         }
-        // celld's per-cell clients share one pre-built store (`with_store`),
-        // so there is no concrete store to borrow a provider from; the static
-        // keys the config carries are the credential. Only an ambient
-        // credential chain needs the provider, and that needs a store this
-        // client built itself.
         let mut provider = None;
         let credential = if !config.access_key_id.is_empty() {
             Arc::new(AwsCredential {
@@ -633,13 +630,12 @@ impl ObjectStoreClient {
                 token: (!config.session_token.is_empty()).then(|| config.session_token.clone()),
             })
         } else {
-            self.store().await?;
-            let s3 = self.s3.get().ok_or_else(|| {
-                Error::Other(
-                    "paged reads over an ambient credential chain need a store this client built"
-                        .into(),
-                )
-            })?;
+            // A shared store erases AmazonS3's credential provider. Waiting
+            // for replica I/O to install it leaves every paged restore with
+            // ambient credentials failing. Build it from the same config on
+            // demand; retain its provider so expired role credentials can
+            // refresh during page faults. Static keys need no second store.
+            let s3 = self.s3().await?;
             provider = Some(s3.credentials().clone());
             s3.credentials()
                 .get_credential()
@@ -949,6 +945,76 @@ impl ReplicaClient for ObjectStoreClient {
             max_txid,
             size: data.len() as i64,
             created_at: Some(created_at),
+            ..Default::default()
+        })
+    }
+
+    async fn write_ltx_file_from_file(
+        &self,
+        level: i32,
+        min_txid: TXID,
+        max_txid: TXID,
+        file: crate::host::HostFile,
+        host: crate::LtxHost,
+    ) -> Result<FileInfo> {
+        let part_size = self.config.effective_part_size().max(MULTIPART_THRESHOLD);
+        let (mut file, first, size) = super::read_upload_chunk(file, &host, 0, part_size).await?;
+        if size < MULTIPART_THRESHOLD as u64 {
+            return self.write_ltx_file(level, min_txid, max_txid, &first).await;
+        }
+        let header = ltx::Header::parse(&first)?;
+        let mut attributes = Attributes::new();
+        attributes.insert(
+            Attribute::Metadata(self.config.timestamp_metadata_key.as_str().into()),
+            AttributeValue::from(format_rfc3339_nano(header.timestamp)?),
+        );
+        let store = self.store().await?;
+        let key = ObjPath::from(self.ltx_key(level, min_txid, max_txid));
+        let mut upload = store
+            .put_multipart_opts(
+                &key,
+                PutMultipartOptions {
+                    attributes,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(map_os_error)?;
+        let upload_result: Result<()> = async {
+            let mut offset = first.len() as u64;
+            upload
+                .put_part(PutPayload::from(first))
+                .await
+                .map_err(map_os_error)?;
+            while offset < size {
+                let (next_file, bytes, _) =
+                    super::read_upload_chunk(file, &host, offset, part_size).await?;
+                file = next_file;
+                offset += bytes.len() as u64;
+                upload
+                    .put_part(PutPayload::from(bytes))
+                    .await
+                    .map_err(map_os_error)?;
+            }
+            upload.complete().await.map_err(map_os_error)?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = upload_result {
+            if let Err(abort_error) = upload.abort().await {
+                tracing::warn!(%abort_error, %key, "failed LTX multipart upload could not be aborted");
+            }
+            return Err(error);
+        }
+        Ok(FileInfo {
+            level,
+            min_txid,
+            max_txid,
+            size: size as i64,
+            created_at: Some(
+                std::time::UNIX_EPOCH
+                    + std::time::Duration::from_millis(header.timestamp.max(0) as u64),
+            ),
             ..Default::default()
         })
     }

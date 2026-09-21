@@ -3,17 +3,17 @@ import { PiHarness } from "agents/harness";
 import { Lifecycle } from "agents/lifecycle";
 import { createWorkersAI } from "agents/providers/pi";
 
-const ENDPOINT = "https://api.cloudflare.com/client/v4/accounts";
-
-function createDirectAi(accountId, token) {
-  const url = `${ENDPOINT}/${accountId}/ai/v1/chat/completions`;
+// The pi provider speaks OpenAI chat completions, so any endpoint with that
+// shape serves it: OpenRouter by default, or a local server through
+// PI_ENDPOINT.
+function createDirectAi(url, key) {
   return {
     async run(model, input, options) {
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${token}`,
+          authorization: `Bearer ${key}`,
         },
         body: JSON.stringify({ model, ...input }),
         signal: options?.signal,
@@ -22,7 +22,7 @@ function createDirectAi(accountId, token) {
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         throw new Error(
-          `Workers AI returned ${response.status}${
+          `${url} returned ${response.status}${
             detail ? `: ${detail.slice(0, 512)}` : ""
           }`,
         );
@@ -36,7 +36,7 @@ function required(env, name) {
   const value = env[name];
   if (!value) {
     throw new Error(
-      `the pi example needs ${name}; set it with CELLD_VAR_${name} or a CELLD_VARS_FILE entry`,
+      `the pi example needs ${name}; set it in .dev.vars or in the vars of wrangler.jsonc`,
     );
   }
   return value;
@@ -49,12 +49,10 @@ export class PiAgent extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     const ai = createDirectAi(
-      required(env, "CLOUDFLARE_ACCOUNT_ID"),
-      required(env, "CLOUDFLARE_API_TOKEN"),
+      required(env, "PI_ENDPOINT"),
+      required(env, "OPENROUTER_API_KEY"),
     );
-    const runtime = createWorkersAI(ai, {
-      ...(env.PI_MODEL ? { model: env.PI_MODEL } : {}),
-    });
+    const runtime = createWorkersAI(ai, { model: required(env, "PI_MODEL") });
     this.harness = new PiHarness({
       models: runtime.models,
       model: runtime.model,

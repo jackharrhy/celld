@@ -15,6 +15,7 @@ use crate::ownership_store::NodeLeaseWire;
 use crate::protocol::{DeployPointer, Manifest, ModuleKind, Rollout};
 use anyhow::{bail, Context};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use crate::cli_output::Format;
 use crate::cli_output::Output;
@@ -107,7 +108,6 @@ impl Record for Check {
         })
     }
 }
-use std::collections::BTreeMap;
 use std::time::Duration;
 use tracing::info;
 
@@ -290,7 +290,7 @@ pub async fn probe_storage_before_serving(bucket: &Bucket, managed: bool) -> any
                 }
                 bail!(
                     "the bucket does not keep the storage contract, so celld cannot serve cells \
-                     safely on it: {reason}. Set CELLD_STORAGE_PROBE=0 to start without this test"
+                     safely on it: {reason}. Use a store that supports the required operations"
                 )
             }
             Err(error) if attempt < ATTEMPTS => {
@@ -604,6 +604,7 @@ pub async fn run_deploy(arguments: Vec<String>) -> anyhow::Result<()> {
     let bucket = options.bucket.expect("validated deployment bucket");
     let store = bucket_client(&bucket, options.endpoint.as_deref(), &region)?;
     validate_bucket(&store).await?;
+    crate::wake_format::ensure_ready(&store).await?;
     let started = std::time::Instant::now();
     deploy::write(&store, &built).await?;
     let location = format!(
@@ -653,6 +654,36 @@ pub async fn load_current_worker(
     node: String,
 ) -> anyhow::Result<LoadedDeployment> {
     load_worker_from_pointer(bucket, CURRENT_POINTER_KEY, node).await
+}
+
+/// Block until the fleet-wide pointer exists, so a self-hosted node that
+/// starts before its first `celld deploy` idles instead of exiting.
+///
+/// The boot path reads `deploy/current.json` and treats "no such key" as
+/// fatal, so a node started against an empty bucket exits and systemd
+/// restarts it in a loop until a deployment appears. The pointer is the
+/// authority, so the node waits for it and then serves it, with no
+/// operator restart. A bucket or transport error still returns `Err`, so
+/// a misconfigured bucket fails the boot rather than waiting forever.
+pub async fn wait_for_deployment_pointer(bucket: &Bucket) -> anyhow::Result<()> {
+    let mut waited = false;
+    loop {
+        if bucket.get(CURRENT_POINTER_KEY).await?.is_some() {
+            if waited {
+                tracing::info!(event = "initial_deployment_found");
+            }
+            return Ok(());
+        }
+        if !waited {
+            waited = true;
+            tracing::info!(
+                event = "awaiting_initial_deployment",
+                "no deployment yet; run `celld deploy` and the node serves it \
+                 without a restart"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// Read the fleet-wide pointer without loading what it names. The watcher
@@ -747,6 +778,12 @@ async fn load_worker_at_pointer(
     }
     crate::protocol::validate_required_features(&manifest.required_features)?;
     crate::protocol::validate_queue_manifest(&manifest)?;
+    // Old managed uploads can contain AI metadata without a required-feature
+    // gate. Refuse it before loading code, rather than serve a missing binding.
+    anyhow::ensure!(
+        bindings(&manifest, "ai").next().is_none(),
+        "AI bindings are not supported; call the provider from application code"
+    );
     let prefix = &pointer.prefix;
     let mut fetched =
         futures_util::future::try_join_all(manifest.modules.iter().map(|module| async move {
@@ -855,10 +892,11 @@ async fn load_worker_at_pointer(
             })
         })
         .collect();
-    let ai_binding = configured_ai_binding(
-        bindings(&manifest, "ai")
-            .find_map(|binding| binding.get("name")?.as_str().map(str::to_string)),
-    );
+    // The `worker_loaders` key of the deployed config. Every entry becomes a
+    // binding of its own, because each loader caches the Workers it loaded.
+    let loader_bindings = bindings(&manifest, "worker_loader")
+        .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
+        .collect();
     let services = service_bindings(&manifest);
     let vars = worker_vars(&manifest)?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
@@ -891,6 +929,8 @@ async fn load_worker_at_pointer(
     let version = manifest.version.clone();
     let prefix = pointer.prefix.clone();
     let crons = manifest.crons.clone();
+    let containers = manifest.containers.clone();
+    let fence_image = manifest.fence_image.clone();
     Ok(LoadedDeployment {
         options: WorkerConfigOptions {
             src,
@@ -903,7 +943,6 @@ async fn load_worker_at_pointer(
             queue_bindings,
             queue_consumers: manifest.queue_consumers,
             workflow_bindings,
-            ai_binding,
             vars,
             node,
             modules,
@@ -913,17 +952,13 @@ async fn load_worker_at_pointer(
         version,
         prefix,
         asset_binding,
+        loader_bindings,
         assets,
         services,
         crons,
+        containers,
+        fence_image,
     })
-}
-
-/// Apply celld's manifest-first precedence for the optional AI binding.
-pub fn configured_ai_binding(manifest_binding: Option<String>) -> Option<String> {
-    manifest_binding
-        .or_else(|| std::env::var("CELLD_AI_BINDING").ok())
-        .or_else(|| std::env::var_os("CELLD_AI_URL").map(|_| "AI".to_string()))
 }
 
 pub struct LoadedDeployment {
@@ -932,10 +967,19 @@ pub struct LoadedDeployment {
     pub version: String,
     pub prefix: String,
     pub asset_binding: Option<String>,
+    /// `env` names of this script's Worker Loaders, from its
+    /// `worker_loaders` config. A script reaches no loader that it does not
+    /// declare, and each loader keeps a cache of its own loaded Workers.
+    pub loader_bindings: Vec<String>,
     pub assets: Option<crate::assets::AssetResolver>,
     pub services: Vec<(String, String, Option<String>)>,
     /// `triggers.crons` from the manifest, driving the reserved cron cell.
     pub crons: Vec<String>,
+    /// `containers` from the manifest: the classes whose cells supervise a
+    /// container.
+    pub containers: Vec<crate::container::ContainerSpec>,
+    /// See `Manifest::fence_image`.
+    pub fence_image: Option<String>,
 }
 
 fn bindings<'a>(
@@ -969,6 +1013,27 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
 }
 
 fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
+    let file = std::env::var("CELLD_VARS_FILE").ok();
+    let overrides: Vec<_> = std::env::vars()
+        .filter_map(|(name, value)| {
+            name.strip_prefix("CELLD_VAR_")
+                .filter(|name| !name.is_empty())
+                .map(|name| (name.to_owned(), value))
+        })
+        .collect();
+    let contents = file
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| format!("read Worker vars file {path}"))
+        })
+        .transpose()?;
+    Ok(merge_worker_vars(manifest, contents.as_deref(), overrides))
+}
+
+fn merge_worker_vars(
+    manifest: &Manifest,
+    contents: Option<&str>,
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
     let mut vars = BTreeMap::new();
     for binding in bindings(manifest, "plain_text") {
         if let (Some(name), Some(value)) = (
@@ -978,9 +1043,7 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             vars.insert(name.to_string(), value.to_string());
         }
     }
-    if let Ok(path) = std::env::var("CELLD_VARS_FILE") {
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("read Worker vars file {path}"))?;
+    if let Some(contents) = contents {
         for line in contents.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -1004,13 +1067,37 @@ fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
             vars.insert(name.to_string(), value.to_string());
         }
     }
-    for (name, value) in std::env::vars() {
-        if let Some(name) = name
-            .strip_prefix("CELLD_VAR_")
-            .filter(|name| !name.is_empty())
-        {
-            vars.insert(name.to_string(), value);
-        }
+    vars.extend(overrides);
+    vars.into_iter().collect()
+}
+
+#[cfg(test)]
+mod local_worker_vars_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_secrets_override_file_and_manifest_without_mutating_deployment() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "test", "script_name": "radio", "main_module": null,
+            "do_classes": [], "sqlite_classes": [], "modules": [],
+            "raw_metadata": {"bindings": [
+                {"type": "plain_text", "name": "SECRET", "text": "manifest-default"},
+                {"type": "plain_text", "name": "UNCHANGED", "text": "public"}
+            ]}
+        }))
+        .unwrap();
+        let before = serde_json::to_vec(&manifest).unwrap();
+        let vars: BTreeMap<_, _> = merge_worker_vars(
+            &manifest,
+            Some("# private file\nSECRET='file-secret'\nFILE_ONLY=\"kept\"\nEMPTY=\n"),
+            [("SECRET".into(), "environment-secret".into())],
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(vars["SECRET"], "environment-secret");
+        assert_eq!(vars["FILE_ONLY"], "kept");
+        assert_eq!(vars["EMPTY"], "");
+        assert_eq!(vars["UNCHANGED"], "public");
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), before);
     }
-    Ok(vars.into_iter().collect())
 }

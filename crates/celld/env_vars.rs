@@ -9,28 +9,166 @@
 use anyhow::{anyhow, bail};
 
 pub const DEFAULT_SHUTDOWN_TOTAL_MS: u64 = 40_000;
-pub const DEFAULT_DRAIN_TOKEN_WAIT_MS: u64 = 30_000;
-pub const MAX_DRAIN_TOKEN_WAIT_NUMERATOR: u64 = 3;
-pub const MAX_DRAIN_TOKEN_WAIT_DENOMINATOR: u64 = 4;
-
-/// Calculate the largest drain-token wait that preserves the shutdown work
-/// share. The split operations avoid overflow for a `u64` process bound.
-pub const fn maximum_drain_token_wait_ms(total_ms: u64) -> u64 {
-    (total_ms / MAX_DRAIN_TOKEN_WAIT_DENOMINATOR) * MAX_DRAIN_TOKEN_WAIT_NUMERATOR
-        + (total_ms % MAX_DRAIN_TOKEN_WAIT_DENOMINATOR) * MAX_DRAIN_TOKEN_WAIT_NUMERATOR
-            / MAX_DRAIN_TOKEN_WAIT_DENOMINATOR
-}
-
-const _: () =
-    assert!(DEFAULT_DRAIN_TOKEN_WAIT_MS == maximum_drain_token_wait_ms(DEFAULT_SHUTDOWN_TOTAL_MS));
-
-/// The two shutdown values whose relationship controls whether handoff work
-/// can start after the drain-token wait.
+/// One process stop budget and the internal waits derived from it.
+/// The absolute deadline also bounds progress extensions, so neither wait
+/// grants time beyond the supervisor-facing process budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShutdownTiming {
     pub total_ms: u64,
     pub drain_token_wait_ms: u64,
+    pub drain_no_progress_ms: u64,
 }
+
+impl ShutdownTiming {
+    fn from_total_ms(total_ms: u64) -> Self {
+        // Preserve the 30-second token wait and 25-second no-progress window
+        // at the default 40-second bound. Derive both when that bound changes:
+        // independent defaults made a shorter supervisor grace fail startup.
+        // Split the arithmetic so even the largest accepted u64 cannot wrap.
+        let drain_token_wait_ms = (total_ms / 4) * 3 + (total_ms % 4) * 3 / 4;
+        let drain_no_progress_ms = ((total_ms / 8) * 5 + (total_ms % 8) * 5 / 8).max(1);
+        Self {
+            total_ms,
+            drain_token_wait_ms,
+            drain_no_progress_ms,
+        }
+    }
+}
+
+/// A variable celld no longer reads, and the sentence that names what an
+/// operator must write instead.
+///
+/// The lists below enumerate the names celld knows, so a name that is not on
+/// one of them is never looked at and never reported. That is correct for a
+/// name celld never had, but wrong for one it removed: the operator set the
+/// removed name on purpose, and the behaviour it bought is gone. A node whose
+/// unit file still carries the name would boot clean, log nothing, and serve a
+/// deployment that no longer has the binding, so the defect would surface as a
+/// `TypeError` in a request handler on a node the operator believes they just
+/// configured. Refusing the boot moves that failure to the moment the operator
+/// can still read the unit file.
+struct Removed {
+    name: &'static str,
+    /// What the operator must write in place of the line they delete.
+    replacement: &'static str,
+    /// Whether the removed reader ignored an empty value. Only a value that
+    /// once changed the node is stale, so this decides whether `NAME=` is a
+    /// line to delete or a line that never did anything. It is a property of
+    /// the reader that went away, so each entry must state it for itself: a
+    /// removed variable whose reader treated `NAME=` as meaningful sets
+    /// `false`, and an operator who templated it to an empty string then still
+    /// gets the refusal they need.
+    empty_was_inert: bool,
+}
+
+const REMOVED: &[Removed] = &[
+    Removed {
+        name: "CELLD_TEST_OTEL_SWEEP_MS",
+        replacement: "remove this setting; celld manages the telemetry retention cadence",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_OTEL_SINK",
+        replacement: "set CELLD_OTEL=1 for the fleet bucket or CELLD_OTEL=<collector URL> for OTLP",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_AI_BINDING",
+        replacement: "remove this setting; call the AI provider from application code",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_AI_URL",
+        replacement: "remove this setting; call the AI provider from application code",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_PACED_HANDOFF",
+        replacement:
+            "remove this setting; celld hands off ownership within CELLD_SHUTDOWN_TOTAL_MS",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_GROUP_COMMIT_MS",
+        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_QUEUE_PRODUCER_GROUP_MS",
+        replacement: "remove this setting; celld uses its built-in Queue batching policy",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_BUNDLE",
+        replacement: "remove this setting; fleet durability uses bundled tiering",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_PRESENCE_SHADOW",
+        replacement:
+            "remove this setting; managed presence no longer compares a shadow lease report",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_STORAGE_PROBE",
+        replacement: "remove this setting; celld checks the storage contract before serving",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_EVICTIONS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_LOG_CAPTURE_WORKERS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_REBALANCE_BATCH_CELLS",
+        replacement: "remove this setting; celld uses its built-in scheduling limits",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_CLOUD_RESTART_ON_DEPLOY",
+        replacement: "remove this setting; managed deployments are adopted in place",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_OUTPUT_GATE",
+        replacement: "remove this setting; celld always waits for durability proof",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_DRAIN_TOKEN_WAIT_MS",
+        replacement: "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the drain-token wait",
+        // Zero disabled the token wait, and an empty value failed parsing.
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_SHUTDOWN_DRAIN_MS",
+        replacement:
+            "set only CELLD_SHUTDOWN_TOTAL_MS; celld derives the handoff no-progress interval",
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_MAX_LOADED_WORKERS",
+        replacement: "remove this setting; celld manages Dynamic Worker admission",
+        // Even an empty value failed in the old typed reader. Refuse it rather
+        // than silently changing the operator's configured admission policy.
+        empty_was_inert: false,
+    },
+    Removed {
+        name: "CELLD_WORKER_LOADER",
+        replacement: "declare `worker_loaders` in the project config",
+        // The reader this replaced was
+        // `var("CELLD_WORKER_LOADER").ok().filter(|name| !name.is_empty())`, so
+        // an empty value never bound a loader. A deployment system that
+        // templates every known name to an empty string must not lose an
+        // upgrade on a node that never used the feature.
+        empty_was_inert: true,
+    },
+];
 
 /// Validate every typed production variable before the runtime starts.
 ///
@@ -38,13 +176,21 @@ pub struct ShutdownTiming {
 /// they cannot return a configuration error at the point of use. This pass
 /// makes those reads infallible without giving malformed values a default.
 pub fn validate() -> anyhow::Result<()> {
+    // Each entry carries its own empty-value rule, because whether `NAME=` was
+    // inert is a property of the reader that went away and not of removal.
+    for removed in REMOVED {
+        let Some(value) = std::env::var_os(removed.name) else {
+            continue;
+        };
+        if removed.empty_was_inert && value.is_empty() {
+            continue;
+        }
+        bail!("{} is removed; {}", removed.name, removed.replacement);
+    }
     for name in [
         "CELLD_CLOUD",
-        "CELLD_CLOUD_RESTART_ON_DEPLOY",
         "CELLD_LTX_COMPACTION",
         "CELLD_LTX_PAGED",
-        "CELLD_OUTPUT_GATE",
-        "CELLD_PRESENCE_SHADOW",
         "CELLD_TRUST_FORWARDED_HEADERS",
         "CELLD_UNSAFE_PUBLIC_ADVERTISE",
     ] {
@@ -54,16 +200,13 @@ pub fn validate() -> anyhow::Result<()> {
     for name in [
         "CELLD_ACTIVATIONS",
         "CELLD_DEPLOY_POLL_S",
-        "CELLD_EVICTIONS",
         "CELLD_FETCH_TIMEOUT_S",
         "CELLD_HANDLER_BUDGET_S",
         "CELLD_IDLE_EVICT_S",
-        "CELLD_LOG_CAPTURE_WORKERS",
         "CELLD_LOG_PIPELINE",
         "CELLD_LTX_COMPACTIONS",
         "CELLD_LTX_COMPACTION_MIN_TXIDS",
         "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
-        "CELLD_MAX_LOADED_WORKERS",
         "CELLD_MAX_CELL_REQUESTS",
         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
         "CELLD_MAX_REQUEST_BODY_BYTES",
@@ -73,9 +216,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_MAX_STATELESS_ISOLATES",
         "CELLD_OPERATION_DEADLINE_MS",
         "CELLD_PLACEMENT_WEIGHT",
-        "CELLD_REBALANCE_BATCH_CELLS",
         "CELLD_RELEASES",
-        "CELLD_SHUTDOWN_DRAIN_MS",
         "CELLD_TOKIO_THREADS",
         "CELLD_TTL_MS",
         "CELLD_WAKER_TICK_MS",
@@ -90,13 +231,11 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_DEPLOY_MAX_AGE_S",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",
-        "CELLD_LOG_GROUP_COMMIT_MS",
         "CELLD_LOG_HEDGE_MS",
         "CELLD_LOG_WINDOW",
         "CELLD_LOG_WINDOW_BYTES",
         "CELLD_MAX_RESIDENT_CELLS",
         "CELLD_MAX_RSS_MB",
-        "CELLD_QUEUE_PRODUCER_GROUP_MS",
         "CELLD_READY_FLEET_GATE_MS",
         "CELLD_REBALANCE_INTERVAL_MS",
     ] {
@@ -134,28 +273,13 @@ pub fn validate() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Read the complete shutdown bound and the drain-token wait together.
-///
-/// The wait can use at most three quarters of the complete bound. The
-/// remaining quarter is available for request drain, ownership handoff,
-/// connection flush, and local durability shutdown.
+/// Resolve all shutdown timing from the operator's complete process bound.
+/// Token acquisition consumes at most three quarters of that bound. The
+/// no-progress interval is five eighths, with a one-millisecond minimum.
+/// The process deadline still caps every shutdown phase and progress reset.
 pub fn shutdown_timing() -> anyhow::Result<ShutdownTiming> {
     let total_ms = positive("CELLD_SHUTDOWN_TOTAL_MS")?.unwrap_or(DEFAULT_SHUTDOWN_TOTAL_MS);
-    let drain_token_wait_ms =
-        with_default("CELLD_DRAIN_TOKEN_WAIT_MS", DEFAULT_DRAIN_TOKEN_WAIT_MS)?;
-    let maximum_wait_ms = maximum_drain_token_wait_ms(total_ms);
-    if drain_token_wait_ms > maximum_wait_ms {
-        bail!(
-            "CELLD_DRAIN_TOKEN_WAIT_MS must be at most \
-             {MAX_DRAIN_TOKEN_WAIT_NUMERATOR}/{MAX_DRAIN_TOKEN_WAIT_DENOMINATOR} of \
-             CELLD_SHUTDOWN_TOTAL_MS; maximum is {maximum_wait_ms} for {total_ms}, \
-             not {drain_token_wait_ms}"
-        );
-    }
-    Ok(ShutdownTiming {
-        total_ms,
-        drain_token_wait_ms,
-    })
+    Ok(ShutdownTiming::from_total_ms(total_ms))
 }
 
 pub fn value(name: &str) -> anyhow::Result<Option<String>> {
@@ -238,4 +362,17 @@ where
     T::Err: std::fmt::Display,
 {
     Ok(positive(name)?.unwrap_or(default))
+}
+
+/// Standalone applications may supply runtime-only secrets. Managed fleets use
+/// upstream's deployment bindings and must not inherit host overrides.
+pub fn validate_worker_overrides(managed: bool) -> anyhow::Result<()> {
+    if managed {
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            anyhow::ensure!(name != "CELLD_VARS_FILE" && !name.starts_with("CELLD_VAR_"),
+                "runtime Worker variable overrides require standalone mode without --control-plane / CELLD_CLOUD");
+        }
+    }
+    Ok(())
 }

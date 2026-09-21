@@ -29,8 +29,8 @@ pub(crate) fn validate_node_name(node: &str) -> anyhow::Result<()> {
 /// (owner read 25 ms, ownership CAS 60 ms, restore 10 ms) and ~10 ms of CPU,
 /// so a bound equal to the thread count admitted 35-40 activations a second
 /// per node whatever the client offered, and 1,000 hibernated alarms due in
-/// one minute were 29 s late at the tail (issue #42 found the same ceiling
-/// on two-core nodes). Eight per thread keeps the CPU share of the route
+/// one minute were 29 s late at the tail. The same ceiling appeared on
+/// two-core nodes. Eight per thread keeps the CPU share of the route
 /// below one core per thread at full duty (measured 30 % of four vCPUs at
 /// 16 slots, 43 % at 64); the floor keeps a one- or two-thread node from
 /// serializing an I/O-bound path; the cap is the point past which more

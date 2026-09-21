@@ -129,6 +129,7 @@ dependencies = [
  "object_store",
  "percent-encoding",
  "rusqlite",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

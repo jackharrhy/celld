@@ -66,6 +66,32 @@ fn sql_err(e: rusqlite::Error) -> Error {
     Error::Other(Box::new(e))
 }
 
+fn disable_lookaside(conn: &Connection) -> Result<()> {
+    // SQLite's default lookaside arena reserves 48 KiB for each connection.
+    // Every resident cell owns both connections below, so the unused arenas
+    // repeat a fixed cost at fleet density. LTX prepares a fixed, small SQL
+    // vocabulary, and the measured durable-write throughput stays flat when
+    // general allocations replace these arenas.
+    //
+    // SAFETY: the caller passes a newly opened connection before its first
+    // SQLite operation, so no lookaside slot can be in use.
+    let result = unsafe {
+        ffi::sqlite3_db_config(
+            conn.handle(),
+            ffi::SQLITE_DBCONFIG_LOOKASIDE,
+            std::ptr::null_mut::<std::ffi::c_void>(),
+            0,
+            0,
+        )
+    };
+    if result != ffi::SQLITE_OK {
+        return Err(Error::Other(
+            format!("disable SQLite lookaside failed: {result}").into(),
+        ));
+    }
+    Ok(())
+}
+
 /// SQLite checkpoint mode. Replaces Go's stringly-typed `mode` param; `Display`
 /// interpolates straight into `PRAGMA wal_checkpoint(<mode>)` (db.go:1905), so it
 /// must render exactly `PASSIVE`/`FULL`/`RESTART`/`TRUNCATE`.
@@ -369,7 +395,7 @@ impl Db {
     }
 
     /// Opens both managed connections through a named SQLite VFS. Used by the
-    /// fault-injection VFS of the test suite and by paged restore's fault-in VFS.
+    /// fault-injection VFS in tests and by paged restore's fault-in VFS.
     pub fn open_with_host_and_vfs(
         path: impl AsRef<Path>,
         host: crate::LtxHost,
@@ -391,6 +417,17 @@ impl Db {
             None => Connection::open(path),
         };
         let conn = open(&path).map_err(sql_err)?;
+        disable_lookaside(&conn)?;
+        // Cap the page cache at 64 KiB; SQLite's default (-2000) lets each
+        // connection grow to 2 MiB, and every resident cell owns this
+        // connection, so the default repeats a dead-weight cost at fleet
+        // density. The connection only runs PRAGMAs, the sealing write to
+        // the control tables, and checkpoints, and a checkpoint streams WAL
+        // frames into the database without revisiting pages, so a larger
+        // cache buys no reuse. 16 default-size pages still cover the
+        // control tables and their schema pages.
+        conn.pragma_update(None, "cache_size", -64)
+            .map_err(sql_err)?;
 
         // DSN pragmas: busy_timeout + wal_autocheckpoint(0) (db.go:818).
         // autocheckpoint MUST be 0 because litestream owns checkpointing.
@@ -418,6 +455,15 @@ impl Db {
 
         // Dedicated read-lock connection (mirrors a second pooled connection).
         let rtx_conn = open(&path).map_err(sql_err)?;
+        disable_lookaside(&rtx_conn)?;
+        // This connection runs one tiny read to take the read lock and then
+        // idles for the whole residency, so SQLite's default page-cache limit
+        // (-2000 = up to 2 MiB) is dead weight repeated per resident cell.
+        // Cap it at a few pages; no user query or checkpoint runs here, so a
+        // smaller cache cannot slow either path.
+        rtx_conn
+            .pragma_update(None, "cache_size", -16)
+            .map_err(sql_err)?;
         rtx_conn
             .busy_timeout(Self::DEFAULT_BUSY_TIMEOUT)
             .map_err(sql_err)?;
@@ -2254,6 +2300,56 @@ fn be_u32(b: &[u8]) -> u32 {
 
 #[doc(hidden)]
 pub mod internal {
+    /// Returns active lookaside slots while SQLite compiles a statement on
+    /// each connection owned by the managed database.
+    pub fn lookaside_used_while_preparing(db: &super::Db) -> super::Result<(i32, i32)> {
+        fn current(conn: &rusqlite::Connection) -> super::Result<i32> {
+            let mut statement = std::ptr::null_mut();
+            // SAFETY: the connection is live, SQLite owns the prepared
+            // statement until the matching finalize, and the SQL includes its
+            // trailing NUL.
+            let result = unsafe {
+                rusqlite::ffi::sqlite3_prepare_v2(
+                    conn.handle(),
+                    c"SELECT 1".as_ptr(),
+                    -1,
+                    &mut statement,
+                    std::ptr::null_mut(),
+                )
+            };
+            if result != rusqlite::ffi::SQLITE_OK {
+                return Err(super::Error::Other(
+                    "failed to prepare lookaside probe".into(),
+                ));
+            }
+
+            let mut active = 0;
+            let mut highwater = 0;
+            // SAFETY: the connection and output pointers remain live for this
+            // call. The status operation does not own either output value.
+            let result = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_LOOKASIDE_USED,
+                    &mut active,
+                    &mut highwater,
+                    0,
+                )
+            };
+            // SAFETY: prepare returned this statement exclusively to this
+            // helper, including when the status operation fails.
+            unsafe { rusqlite::ffi::sqlite3_finalize(statement) };
+            if result != rusqlite::ffi::SQLITE_OK {
+                return Err(super::Error::Other(
+                    "failed to read SQLite lookaside status".into(),
+                ));
+            }
+            Ok(active)
+        }
+
+        Ok((current(&db.conn)?, current(&db.rtx_conn)?))
+    }
+
     /// Counts SQL compilations on the capture's connections: SQLite runs the
     /// authorizer once per compilation, so the counter moves for a fresh
     /// `prepare` and for a re-prepare, and stays still for a cached statement.
@@ -2315,6 +2411,19 @@ pub mod internal {
     pub fn wal_autocheckpoint(db: &Db) -> Result<i64> {
         db.conn
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .map_err(sql_err)
+    }
+
+    /// The effective `PRAGMA cache_size` of the writer connection.
+    pub fn writer_cache_size(db: &Db) -> Result<i64> {
+        db.conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .map_err(sql_err)
+    }
+
+    pub fn read_lock_connection_cache_size(db: &Db) -> Result<i64> {
+        db.rtx_conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
             .map_err(sql_err)
     }
 

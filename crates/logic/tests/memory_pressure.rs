@@ -11,6 +11,7 @@ fn load(rss: u64, in_use: u64, working_set: Option<u64>, current: Option<u64>) -
         in_use_bytes: in_use,
         cgroup_working_set_bytes: working_set,
         cgroup_current_bytes: current,
+        container_reserved_bytes: 0,
     }
 }
 
@@ -77,4 +78,17 @@ fn missing_working_set_uses_raw_charge_and_non_cgroup_hosts_use_rss() {
             Some(SHED_RSS_HARD)
         );
     }
+}
+
+#[test]
+fn container_reservations_count_above_reclaimable_file_cache() {
+    let mut sample = load(256 * MIB, 192 * MIB, Some(300 * MIB), Some(1024 * MIB));
+    sample.container_reserved_bytes = 700 * MIB;
+    assert_eq!(sample.hard_bytes(), 1000 * MIB);
+    assert_eq!(sample.memory_bytes(), 936 * MIB);
+    let config = PressureConfig::from_limits(Some(1024 * MIB), None);
+    assert_eq!(
+        config.classify(sample, Latches::default()).1,
+        Some(SHED_RSS_HARD)
+    );
 }

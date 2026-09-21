@@ -76,13 +76,13 @@ impl Retention {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SinkChoice {
     /// Parquet into the operator's bucket: zero configuration beyond the flag.
     /// DuckDB reads the result as described in `docs/telemetry.md`.
     Bucket,
     /// OTLP/http-protobuf to a collector — the ClickHouse-class path.
-    Otlp,
+    Otlp { endpoint: String },
 }
 
 #[derive(Debug)]
@@ -91,9 +91,6 @@ pub struct Config {
     /// `CELLD_OTEL_BUCKET`, same endpoint/region/credentials as the
     /// fleet bucket. `None` means the fleet bucket itself.
     pub bucket_override: Option<String>,
-    /// Base OTLP endpoint; `/v1/traces` and `/v1/logs` are appended,
-    /// per the spec's default-port convention.
-    pub otlp_endpoint: String,
     pub otlp_headers: Vec<(String, String)>,
     pub otlp_timeout: Duration,
     pub service: String,
@@ -103,37 +100,40 @@ pub struct Config {
     pub parent_based: bool,
     pub retention: Retention,
     pub flush: Duration,
-    /// Estimated buffered bytes that force a flush before `flush` elapses —
-    /// Firehose semantics: time or size, whichever first. Keeps a busy
-    /// node's Parquet objects near this size instead of thousands of
-    /// slivers per hour.
+    /// Estimated buffered bytes that trigger an early flush. This controls
+    /// batching independently of the export delay. One event can exceed it.
     pub flush_bytes: usize,
-    /// How often the retention sweep runs.
-    pub sweep: Duration,
 }
 
 impl Config {
     /// `None` when `CELLD_OTEL` is unset or `0` — the default, and the
     /// only zero-cost state.
     pub fn from_env() -> anyhow::Result<Option<Config>> {
-        let enabled = crate::env_vars::flag("CELLD_OTEL", false)?;
-        Self::from_lookup(enabled, crate::env_vars::value)
+        Self::from_lookup(crate::env_vars::value)
     }
 
     #[doc(hidden)]
     pub fn from_lookup(
-        enabled: bool,
         get: impl Fn(&str) -> anyhow::Result<Option<String>>,
     ) -> anyhow::Result<Option<Config>> {
-        let sink = match get("CELLD_OTEL_SINK")?.as_deref() {
-            None | Some("bucket") => SinkChoice::Bucket,
-            Some("otlp") => SinkChoice::Otlp,
-            Some(other) => bail!("unknown CELLD_OTEL_SINK {other:?}"),
+        let sink = match get("CELLD_OTEL")?.as_deref() {
+            None | Some("0") => None,
+            Some("1") => Some(SinkChoice::Bucket),
+            Some(value) => {
+                let endpoint = reqwest::Url::parse(value)
+                    .ok()
+                    .filter(|url| {
+                        matches!(url.scheme(), "http" | "https")
+                            && url.host_str().is_some()
+                            && url.query().is_none()
+                            && url.fragment().is_none()
+                    })
+                    .ok_or_else(|| anyhow!("CELLD_OTEL must be 0, 1, or an HTTP(S) collector base URL, not {value:?}"))?;
+                Some(SinkChoice::Otlp {
+                    endpoint: endpoint.as_str().trim_end_matches('/').to_string(),
+                })
+            }
         };
-        let otlp_endpoint = get("OTEL_EXPORTER_OTLP_ENDPOINT")?
-            .unwrap_or_else(|| "http://localhost:4318".to_string())
-            .trim_end_matches('/')
-            .to_string();
         let mut otlp_headers = Vec::new();
         if let Some(list) = get("OTEL_EXPORTER_OTLP_HEADERS")? {
             for pair in list.split(',').filter(|pair| !pair.trim().is_empty()) {
@@ -187,14 +187,6 @@ impl Config {
                 Retention::Days(days)
             }
         };
-        // The production cadence is policy, not operator configuration. A
-        // short override supports controlled retention validation.
-        let sweep = crate::env_vars::parse_positive::<u64>(
-            "CELLD_TEST_OTEL_SWEEP_MS",
-            get("CELLD_TEST_OTEL_SWEEP_MS")?,
-        )?
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(6 * 3600));
         let flush = crate::env_vars::parse_positive::<u64>(
             "CELLD_OTEL_FLUSH_MS",
             get("CELLD_OTEL_FLUSH_MS")?,
@@ -206,10 +198,10 @@ impl Config {
             get("CELLD_OTEL_FLUSH_BYTES")?,
         )?
         .unwrap_or(5 * 1024 * 1024);
-        Ok(enabled.then_some(Config {
+        let bucket_override = get("CELLD_OTEL_BUCKET")?;
+        Ok(sink.map(|sink| Config {
             sink,
-            bucket_override: get("CELLD_OTEL_BUCKET")?,
-            otlp_endpoint,
+            bucket_override,
             otlp_headers,
             otlp_timeout,
             service,
@@ -218,7 +210,6 @@ impl Config {
             retention,
             flush,
             flush_bytes,
-            sweep,
         }))
     }
 }
@@ -500,7 +491,7 @@ fn decide_with_sampler(
     (trace_id, sampled)
 }
 
-/// The sampler is private, so the private suite reaches the decision
+/// The sampler is private, so tests reach the decision
 /// through the ratio the configuration carries.
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]
@@ -585,14 +576,14 @@ pub fn now_unix_us() -> i64 {
 }
 
 /// Start the pipeline. Called at most once, from startup, only when the
-/// operator turned telemetry on and a bucket exists.
+/// operator selects a bucket or a collector.
 pub fn init(
     config: &Config,
     bucket: Option<Bucket>,
     node: String,
     region: String,
 ) -> anyhow::Result<()> {
-    let sink = match config.sink {
+    let sink = match &config.sink {
         SinkChoice::Bucket => {
             let bucket = bucket.expect("the bucket sink needs a bucket");
             tracing::info!(
@@ -602,16 +593,16 @@ pub fn init(
                 "telemetry on; Parquet to the bucket"
             );
             if let Retention::Days(days) = config.retention {
-                tokio::spawn(sweep_loop(bucket.clone(), days, config.sweep));
+                tokio::spawn(sweep_loop(bucket.clone(), days));
             }
             SinkRuntime::Bucket {
                 bucket,
                 retention: config.retention.label(),
             }
         }
-        SinkChoice::Otlp => {
+        SinkChoice::Otlp { endpoint } => {
             tracing::info!(
-                endpoint = %config.otlp_endpoint,
+                endpoint = %endpoint,
                 sample_ratio = config.sample_ratio,
                 "telemetry on; OTLP to the collector"
             );
@@ -620,8 +611,8 @@ pub fn init(
                     .timeout(config.otlp_timeout)
                     .build()
                     .map_err(|error| anyhow!("otlp client: {error}"))?,
-                traces_url: format!("{}/v1/traces", config.otlp_endpoint),
-                logs_url: format!("{}/v1/logs", config.otlp_endpoint),
+                traces_url: format!("{endpoint}/v1/traces"),
+                logs_url: format!("{endpoint}/v1/logs"),
                 headers: config.otlp_headers.clone(),
             }
         }
@@ -940,14 +931,14 @@ pub fn object_key(prefix: &str, node: &str, unix_us: i64) -> String {
 /// race between nodes — every node sweeps the whole telemetry prefix,
 /// so a dead node's data expires too. The sweep enforces the *current*
 /// configuration; the per-object retention stamp is forensic.
-async fn sweep_loop(bucket: Bucket, retention_days: u32, every: Duration) {
+async fn sweep_loop(bucket: Bucket, retention_days: u32) {
     loop {
         let cutoff = cutoff_date(now_unix_us(), retention_days);
         let deleted = sweep_once(&bucket, cutoff).await;
         if deleted > 0 {
             tracing::info!(deleted, retention_days, "telemetry swept");
         }
-        tokio::time::sleep(every).await;
+        tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
     }
 }
 

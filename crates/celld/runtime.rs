@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -122,7 +122,7 @@ impl RequestCancellationLifetime {
         headers: Vec<(String, String)>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<HttpResponse>>,
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let job = stateless_fetch_job_factory(url, method, body, headers, Some(self))(reply);
+        let job = stateless_fetch_job_factory(None, url, method, body, headers, Some(self))(reply);
         drive_affiliated(slot.affiliate(), job, None)
     }
 }
@@ -137,6 +137,7 @@ struct StatelessWorkerJob {
 
 impl StatelessWorkerJob {
     fn fetch(
+        entrypoint: Option<crate::WorkerFetchEntrypoint>,
         url: String,
         method: String,
         body: js::RequestBody,
@@ -150,11 +151,14 @@ impl StatelessWorkerJob {
         Self {
             job: crate::WorkerJob::Fetch {
                 queued_at: Instant::now(),
+                entrypoint,
+                invocation_limits: None,
                 url,
                 method,
                 body,
                 headers,
                 request_id,
+                tail_report: None,
                 reply,
             },
             cancellation,
@@ -177,6 +181,7 @@ impl StatelessWorkerJob {
 }
 
 fn stateless_fetch_job_factory(
+    entrypoint: Option<crate::WorkerFetchEntrypoint>,
     url: String,
     method: String,
     body: js::RequestBody,
@@ -186,7 +191,9 @@ fn stateless_fetch_job_factory(
     // The factory crosses the admission await, so it owns retirement until it
     // transfers the same guard into the spawned driver's job.
     let cancellation = RequestCancellationGuard::new(cancellation);
-    move |reply| StatelessWorkerJob::fetch(url, method, body, headers, cancellation, reply)
+    move |reply| {
+        StatelessWorkerJob::fetch(entrypoint, url, method, body, headers, cancellation, reply)
+    }
 }
 
 /// Remove a request's cancellation state when its driver leaves. Each
@@ -563,10 +570,10 @@ struct CellHandle {
     /// The cell's claim on the isolate holding its realm. An event knows
     /// where to run from it, and dropping it gives the placement back.
     residency: crate::pool::Residency,
-    /// The last alarm the reporter saw, `-1` for none: the cache behind
-    /// `alarm()`'s point query. Written only by the effect path — a turn
-    /// moves an alarm, its drive reports it — never by storage directly.
-    next_alarm_ms: AtomicI64,
+    /// The source value and wake revision stay together in the registry.
+    /// Reading a newer flusher revision beside an older cached value would
+    /// authorize that old value to delete a later arm's entry.
+    alarm: celld_logic::wake::AlarmSnapshot,
     requests: Arc<CellRequestAdmission>,
 }
 
@@ -611,16 +618,16 @@ struct AdmittedCellRequest {
     permit: CellRequestPermit,
 }
 
-pub type AlarmObserver = Arc<dyn Fn(String, Option<i64>) + Send + Sync>;
+pub type AlarmObserver = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + Send + Sync>;
 
 /// How a turn's alarm move reaches the host. `drive_cell` calls it with
 /// what `take_alarm_moves` drained; it caches the value on the cell's
 /// handle and forwards a real change to the observer.
 #[doc(hidden)]
-pub type AlarmReporter = Arc<dyn Fn(String, i64) + Send + Sync>;
+pub type AlarmReporter = Arc<dyn Fn(String, celld_logic::wake::AlarmSnapshot) + Send + Sync>;
 
-/// Re-arming the same time is not a change the host needs to hear twice —
-/// the dedupe the old watcher's diffing provided, kept by the cache. A
+/// Each committed installation reaches the host, including same-time re-arms.
+/// Duplicate observations of that installation are deduplicated. A
 /// scope without a handle was stopped mid-flight; its ActivityFinished
 /// report is gone with it, so a move for it says nothing and is dropped.
 ///
@@ -634,17 +641,25 @@ pub type AlarmReporter = Arc<dyn Fn(String, i64) + Send + Sync>;
 fn alarm_reporter(cells: &Arc<Mutex<CellRegistry>>, observe: &AlarmObserver) -> AlarmReporter {
     let cells_ = cells.clone();
     let observe_ = observe.clone();
-    Arc::new(move |scope: String, at_ms: i64| {
-        let registry = cells_.lock().expect("cell registry poisoned");
-        let changed = registry
-            .published
-            .get(&scope)
-            .or_else(|| registry.starting.get(&scope))
-            .is_some_and(|handle| handle.next_alarm_ms.swap(at_ms, Ordering::AcqRel) != at_ms);
-        if changed {
-            observe_(scope, (at_ms >= 0).then_some(at_ms));
-        }
-    })
+    Arc::new(
+        move |scope: String, alarm: celld_logic::wake::AlarmSnapshot| {
+            let mut registry = cells_.lock().expect("cell registry poisoned");
+            let handle = if let Some(handle) = registry.published.get_mut(&scope) {
+                Some(handle)
+            } else {
+                registry.starting.get_mut(&scope)
+            };
+            if let Some(handle) = handle {
+                let changed = handle.alarm.at_ms() != alarm.at_ms();
+                // Refresh the revision even when a same-time rearm needs no timer
+                // change. An ActivityFinished must use that source's snapshot.
+                handle.alarm = alarm;
+                if changed {
+                    observe_(scope, alarm);
+                }
+            }
+        },
+    )
 }
 
 #[derive(Default)]
@@ -695,10 +710,18 @@ pub(crate) enum CellHost {
     Scripted(crate::conformance_sim_cell_host::SimCellHost),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum StopMode {
     /// Prove the final position, then optionally retain a local base.
-    Evict { preserve_local: bool },
+    ///
+    /// `abandon` travels with `preserve_local` because an eviction that could
+    /// be abandoned and an eviction that keeps a local base are the same
+    /// eviction: the one a live node can change its mind about. A drain and a
+    /// fence carry neither.
+    Evict {
+        preserve_local: bool,
+        abandon: Option<Arc<crate::replication::EvictionAbandon>>,
+    },
     /// Prove the final position and retain it for the successor epoch.
     Rebase,
     /// Close without a remote write because the caller lacks authority.
@@ -768,11 +791,20 @@ impl CellHost {
         }
     }
 
-    pub(crate) async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+    pub(crate) async fn ensure_durable(
+        &self,
+        cell: &str,
+        epoch: u64,
+        revocable: bool,
+    ) -> anyhow::Result<()> {
         match self {
-            Self::V8(runtime) => runtime.ensure_durable(cell, epoch).await,
+            Self::V8(runtime) => runtime.ensure_durable(cell, epoch, revocable).await,
+            // The scripted host owns a real replicator over a real object
+            // store, so it takes the same gate. Letting it skip the gate made
+            // the gate unreachable from the deterministic worlds, which is
+            // why no case noticed when the pre-close check was removed.
             #[cfg(all(test, celld_internal_tests))]
-            Self::Scripted(runtime) => runtime.ensure_durable(cell, epoch).await,
+            Self::Scripted(runtime) => runtime.ensure_durable(cell, epoch, revocable).await,
         }
     }
 
@@ -810,16 +842,33 @@ impl CellHost {
         }
     }
 
-    /// Read one V8 alarm-cache observation in reporter order. A scripted host
-    /// owns its alarm outcome in the simulation, so the actor must not invent
-    /// a second observation for it.
-    pub(crate) fn alarm_observation(&self, cell: &str) -> Option<(Option<i64>, bool)> {
+    /// Keep the snapshot and its consumer under the host's reporter lock.
+    /// An activity completion sent after a newer report can otherwise erase it.
+    pub(crate) fn with_alarm<T>(
+        &self,
+        cell: &str,
+        f: impl FnOnce(celld_logic::wake::AlarmSnapshot, bool) -> T,
+    ) -> T {
         match self {
-            Self::V8(runtime) => {
-                Some(runtime.with_alarm(cell, |at_ms| (at_ms, runtime.alarm_covered(cell, at_ms))))
-            }
+            Self::V8(runtime) => runtime
+                .with_alarm_snapshot(cell, |alarm| f(alarm, runtime.alarm_covered(cell, alarm))),
             #[cfg(all(test, celld_internal_tests))]
-            Self::Scripted(_) => None,
+            Self::Scripted(runtime) => runtime.with_alarm(cell, f),
+        }
+    }
+
+    /// Legacy scripted drivers supply their own observations. A host connected
+    /// to the activity path supplies them through the same boundary as V8.
+    pub(crate) fn alarm_observation(
+        &self,
+        cell: &str,
+    ) -> Option<(celld_logic::wake::AlarmSnapshot, bool)> {
+        match self {
+            Self::V8(_) => Some(self.with_alarm(cell, |alarm, covered| (alarm, covered))),
+            #[cfg(all(test, celld_internal_tests))]
+            Self::Scripted(runtime) => runtime
+                .observes_activity_alarms()
+                .then(|| self.with_alarm(cell, |alarm, covered| (alarm, covered))),
         }
     }
 
@@ -830,16 +879,16 @@ impl CellHost {
     pub(crate) async fn refresh_handoff_alarm_coverage(
         &self,
         cell: &str,
-        at_ms: i64,
-    ) -> Option<(Option<i64>, bool)> {
-        match self {
-            Self::V8(_) => {
-                js::reconcile_wake_entry(cell, at_ms, true).await;
-                self.alarm_observation(cell)
-            }
-            #[cfg(all(test, celld_internal_tests))]
-            Self::Scripted(_) => None,
+        alarm: celld_logic::wake::AlarmSnapshot,
+    ) -> Option<(celld_logic::wake::AlarmSnapshot, bool)> {
+        #[cfg(all(test, celld_internal_tests))]
+        if matches!(self, Self::Scripted(host) if !host.observes_activity_alarms()) {
+            return None;
         }
+        if js::publish_observed_wake_entry(cell, alarm).await.is_err() {
+            return None;
+        }
+        self.alarm_observation(cell)
     }
 
     pub(crate) async fn fire_alarm(
@@ -847,7 +896,7 @@ impl CellHost {
         op: celld_logic::OpId,
         cell: String,
         scheduled_ms: i64,
-    ) -> anyhow::Result<(Option<i64>, bool, Option<u64>)> {
+    ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
         match self {
             Self::V8(runtime) => runtime.fire_alarm(op, cell, scheduled_ms).await,
             #[cfg(all(test, celld_internal_tests))]
@@ -874,6 +923,9 @@ pub struct RuntimeOptions {
     pub alarm_observer: AlarmObserver,
     pub node: String,
     pub region: String,
+    /// The fleet bucket, where container images live. `None` for a local
+    /// script, which has no bucket and loads images from the engine alone.
+    pub bucket: Option<crate::bucket::Bucket>,
 }
 
 /// A service-binding fetch crossing from a calling isolate into the router.
@@ -882,6 +934,7 @@ pub struct ServiceFetch {
     /// deployment graph.
     pub generation: GenerationId,
     pub script: String,
+    pub entrypoint: Option<crate::WorkerFetchEntrypoint>,
     pub url: String,
     pub method: String,
     pub body: js::RequestBody,
@@ -976,8 +1029,8 @@ impl Replication {
         self.ltx.prune_local_cache(max_bytes)
     }
 
-    pub fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
-        self.ltx.close_for_reload(cell, epoch)
+    pub async fn close_for_reload(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+        self.ltx.close_for_reload(cell, epoch).await
     }
 
     pub fn local_cells(&self) -> Vec<celld_logic::LocalCell> {
@@ -1005,9 +1058,11 @@ impl Replication {
         self.ltx.restore_snapshot(cell).await
     }
 
-    async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
-        self.ltx.handoff_wait(cell, epoch).await?;
-        Ok(())
+    /// The eviction gate. `LtxRepl::handoff_gate` holds the reasoning: it
+    /// owns both questions the gate asks, so the V8 host and the scripted
+    /// host cannot drift apart on which one a revocable eviction takes.
+    async fn ensure_durable(&self, cell: &str, epoch: u64, revocable: bool) -> anyhow::Result<()> {
+        self.ltx.handoff_gate(cell, epoch, revocable).await
     }
 
     /// The output-gate durability wait: return the committed-write position the
@@ -1024,9 +1079,15 @@ impl Replication {
         self.ltx.await_durable(cell, epoch, position).await
     }
 
-    async fn evict(&self, cell: &str, epoch: u64, preserve_local: bool) -> anyhow::Result<()> {
+    async fn evict(
+        &self,
+        cell: &str,
+        epoch: u64,
+        preserve_local: bool,
+        abandon: Option<&crate::replication::EvictionAbandon>,
+    ) -> anyhow::Result<()> {
         self.ltx
-            .evict(cell, epoch, preserve_local)
+            .evict(cell, epoch, preserve_local, abandon)
             .await
             .map(|_| ())
     }
@@ -1057,11 +1118,7 @@ impl Generation {
         graph: DeploymentGraph,
         options: GenerationOptions,
     ) -> anyhow::Result<Self> {
-        let GenerationOptions {
-            loader_binding,
-            node,
-            region,
-        } = options;
+        let GenerationOptions { node, region } = options;
         let DeploymentGraph { primary, cohosted } = graph;
         init_v8();
 
@@ -1097,21 +1154,11 @@ impl Generation {
 
         let node: Arc<str> = Arc::from(node);
         let region: Arc<str> = Arc::from(region);
-        let crate::fleet::LoadedDeployment {
-            options: worker,
-            script_name: primary_script,
-            version,
-            prefix,
-            asset_binding,
-            assets: primary_assets,
-            services,
-            crons,
-        } = primary;
-        let mut assets = HashMap::new();
-        if let Some(resolver) = primary_assets {
-            assets.insert(primary_script.clone(), resolver);
-        }
-        let primary_classes = worker.do_classes.clone();
+        let primary_script = primary.script_name.clone();
+        let version = primary.version.clone();
+        let prefix = primary.prefix.clone();
+        let mut all_containers = Vec::new();
+        let mut fence_image = None;
         // Only classes the user declared can be a bare-id default. Every
         // runtime-supplied class rides in `do_classes` so that its namespace
         // key is minted, and counting one here made adding any D1 binding flip
@@ -1125,24 +1172,14 @@ impl Generation {
         // and `__Workflow` walked straight back into the same bug when it
         // shipped. A fourth reserved class must not be able to do it a third
         // time.
-        let user_classes: Vec<&String> = worker
+        let user_classes: Vec<&String> = primary
+            .options
             .do_classes
             .iter()
             .filter(|class| !crate::deploy::is_reserved_class(class))
             .collect();
         let default_do_class =
             (user_classes.len() == 1).then(|| Arc::from(user_classes[0].as_str()));
-        let config = Arc::new(
-            WorkerConfig::new(worker)
-                .with_services(services)
-                .with_asset_binding(asset_binding)
-                .with_loader(loader_binding)
-                .with_queue_consumers(queue_catalog.clone())
-                .with_crons(crons.clone())
-                .with_generation(id),
-        );
-        let stateless = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
-        let mut service_pools = HashMap::from([(primary_script.clone(), stateless.clone())]);
         // Two scripts exporting one class name is genuinely ambiguous and is
         // refused — but a *reserved* class is not an export, and the two kinds
         // behave differently:
@@ -1158,53 +1195,63 @@ impl Generation {
         // scripts produce two distinct names and never reach this branch. If
         // one ever did, it would be a real collision and must still be refused.
         let mut cell_configs: HashMap<String, Arc<WorkerConfig>> = HashMap::new();
-        for class in primary_classes {
-            register_cell_class(&mut cell_configs, class, config.clone(), &|class| {
-                anyhow!("duplicate Durable Object class {class}")
-            })?;
-        }
-        // The reserved cron cell is not a user class, so it is registered here
-        // rather than arriving in the manifest's `do_classes`. It shares the
-        // primary Worker's config because its alarm's only job is to call that
-        // script's `scheduled` handler.
-        if !config.crons.is_empty() {
-            cell_configs.insert(
-                celld_logic::cron::RESERVED_CLASS.to_string(),
-                config.clone(),
-            );
-        }
-        for target in cohosted {
+        let mut service_pools = HashMap::new();
+        let mut assets = HashMap::new();
+        // Primary first: shared reserved classes retain the first script's
+        // config. Only this script owns ingress and the node's cron schedule;
+        // bindings and runtime construction follow the same path for all scripts.
+        for (index, deployment) in std::iter::once(primary).chain(cohosted).enumerate() {
+            let is_primary = index == 0;
             let crate::fleet::LoadedDeployment {
                 options,
                 script_name: script,
                 asset_binding,
-                assets: target_assets,
+                loader_bindings,
+                assets: resolver,
                 services,
+                crons,
+                containers,
+                fence_image: fence,
                 ..
-            } = target;
-            if let Some(resolver) = target_assets {
+            } = deployment;
+            all_containers.extend(containers.iter().cloned());
+            fence_image = fence_image.or(fence);
+            if let Some(resolver) = resolver {
                 assets.insert(script.clone(), resolver);
             }
-            let target_classes = options.do_classes.clone();
+            let classes = options.do_classes.clone();
             let config = Arc::new(
                 WorkerConfig::new(options)
                     .with_services(services)
                     .with_asset_binding(asset_binding)
+                    .with_loaders(loader_bindings)
                     .with_queue_consumers(queue_catalog.clone())
+                    .with_crons(if is_primary { crons } else { Vec::new() })
+                    .with_containers(containers)
                     .with_generation(id),
             );
             let pool = StatelessRuntime::start(config.clone(), node.clone(), region.clone())?;
             if service_pools.insert(script.clone(), pool).is_some() {
                 return Err(anyhow!("duplicate co-hosted Worker script {script}"));
             }
-            for class in target_classes {
+            for class in classes {
                 register_cell_class(&mut cell_configs, class, config.clone(), &|class| {
-                    anyhow!(
-                        "Durable Object class {class} is exported by more than one co-hosted script"
-                    )
+                    if is_primary {
+                        anyhow!("duplicate Durable Object class {class}")
+                    } else {
+                        anyhow!(
+                            "Durable Object class {class} is exported by more than one co-hosted script"
+                        )
+                    }
                 })?;
             }
+            // Cron is runtime-supplied, not a manifest class. Its alarm calls
+            // the primary script's scheduled handler with that script's bindings.
+            if !config.crons.is_empty() {
+                cell_configs.insert(celld_logic::cron::RESERVED_CLASS.to_string(), config);
+            }
         }
+        let stateless = service_pools[&primary_script].clone();
         let cell_isolates: HashMap<String, Arc<crate::pool::Pool>> = cell_configs
             .values()
             .map(|config| {
@@ -1230,7 +1277,8 @@ impl Generation {
             cell_isolates,
             default_do_class,
             assets,
-            crons,
+            containers: all_containers,
+            fence_image,
         })
     }
 }
@@ -1399,6 +1447,7 @@ impl RuntimeManager {
             alarm_observer,
             node,
             region,
+            bucket,
         } = options;
         let max_cell_requests =
             crate::env_vars::positive_or("CELLD_MAX_CELL_REQUESTS", DEFAULT_MAX_CELL_REQUESTS)?;
@@ -1426,6 +1475,12 @@ impl RuntimeManager {
             max_cell_requests,
         };
         manager.watch_generation(&generation);
+        crate::container::configure(
+            manager.node.to_string(),
+            bucket,
+            manager.data_dir.as_ref().clone(),
+        );
+        install_container_specs(&generation);
         Ok(manager)
     }
 
@@ -1487,6 +1542,7 @@ impl RuntimeManager {
     pub fn adopt(&self, generation: Generation) -> Arc<Generation> {
         let next = Arc::new(generation);
         self.watch_generation(&next);
+        install_container_specs(&next);
         let previous = {
             let mut generations = self.generations.write().expect("generation lock poisoned");
             let previous = std::mem::replace(&mut generations.current, next.clone());
@@ -1513,15 +1569,15 @@ impl RuntimeManager {
         next
     }
 
-    /// The generations still draining: id and version, for `/state`.
-    pub fn draining_generations(&self) -> Vec<(GenerationId, String)> {
+    /// The generations still draining, for `/state`. Each one holds its
+    /// isolates until the last cell in them moves, so the caller reads the
+    /// census from the generation and not only its version.
+    pub fn draining_generations(&self) -> Vec<Arc<Generation>> {
         self.generations
             .read()
             .expect("generation lock poisoned")
             .draining
-            .iter()
-            .map(|generation| (generation.id, generation.version.clone()))
-            .collect()
+            .clone()
     }
 
     /// Spawn the maintenance loop for one generation's cell pools.
@@ -1680,11 +1736,14 @@ impl RuntimeManager {
         let (reply, receive) = tokio::sync::oneshot::channel();
         let job = crate::WorkerJob::Fetch {
             queued_at: Instant::now(),
+            entrypoint: None,
+            invocation_limits: None,
             url,
             method,
             body,
             headers,
             request_id: Some(request_id),
+            tail_report: None,
             reply,
         };
         tokio::spawn(async move {
@@ -1702,6 +1761,7 @@ impl RuntimeManager {
         let ServiceFetch {
             generation,
             script,
+            entrypoint,
             url,
             method,
             body,
@@ -1713,7 +1773,14 @@ impl RuntimeManager {
             .service(&script)
             .ok_or_else(|| anyhow!("no service Worker for script {script}"))?;
         let cancellation = RequestCancellationLifetime::stateless();
-        let response = pool.fetch(url, method, body, headers, Some(cancellation.clone()));
+        let response = pool.fetch_target(
+            entrypoint,
+            url,
+            method,
+            body,
+            headers,
+            Some(cancellation.clone()),
+        );
         receive_service_fetch_response(response, cancellation, cancel).await
     }
 
@@ -1722,14 +1789,14 @@ impl RuntimeManager {
         generation: GenerationId,
         script: &str,
         entrypoint: String,
-        method: String,
-        args: Vec<u8>,
+        props: Vec<u8>,
+        operation: crate::WorkerRpcOperation,
     ) -> anyhow::Result<Vec<u8>> {
         let generation = self.generation_by_id(generation);
         generation
             .service(script)
             .ok_or_else(|| anyhow!("no service Worker for script {script}"))?
-            .rpc(entrypoint, method, args)
+            .rpc(entrypoint, props, operation)
             .await
     }
 
@@ -1802,7 +1869,10 @@ impl RuntimeManager {
         .ok()
         .flatten();
         restored_alarm_from_persisted(cell, persisted, |at_ms| {
-            self.alarm_covered(cell, Some(at_ms))
+            self.alarm_covered(
+                cell,
+                celld_logic::wake::AlarmSnapshot::without_wake(Some(at_ms)),
+            )
         })
     }
 
@@ -1820,9 +1890,9 @@ impl RuntimeManager {
         Ok(replication.local_cells())
     }
 
-    /// Close every resident runtime, retain its exact database path, remove
-    /// stale live-named epochs, and publish one node-level local certificate.
-    /// The caller has already stopped admission and drained request effects.
+    /// Detach every resident runtime, prove and retain its exact database path,
+    /// and remove stale live-named epochs. The caller has already stopped
+    /// admission and drained request effects.
     pub async fn prepare_clean_reload(
         &self,
         cells: &[celld_logic::PresenceCell],
@@ -1844,10 +1914,11 @@ impl RuntimeManager {
                 let runtime = self.clone();
                 let replication = replication.clone();
                 async move {
-                    runtime
-                        .stop_cell(&cell.id, cell.epoch, StopMode::CloseInPlace)
-                        .await?;
-                    replication.close_for_reload(&cell.id, cell.epoch)
+                    // A normal stop releases the replica before returning.
+                    // Keep it registered until the final capture proves the
+                    // stopped database position present in the bucket.
+                    runtime.swap_out_cell(&cell.id, cell.epoch).await?;
+                    replication.close_for_reload(&cell.id, cell.epoch).await
                 }
             })
             .buffer_unordered(128);
@@ -1865,9 +1936,14 @@ impl RuntimeManager {
         }
     }
 
-    pub async fn ensure_durable(&self, cell: &str, epoch: u64) -> anyhow::Result<()> {
+    pub async fn ensure_durable(
+        &self,
+        cell: &str,
+        epoch: u64,
+        revocable: bool,
+    ) -> anyhow::Result<()> {
         match &self.replication {
-            Some(replication) => replication.ensure_durable(cell, epoch).await,
+            Some(replication) => replication.ensure_durable(cell, epoch, revocable).await,
             None => Ok(()),
         }
     }
@@ -1971,6 +2047,13 @@ impl RuntimeManager {
         let config = generation
             .cell_config(class)
             .ok_or_else(|| anyhow!("no Worker exports Durable Object class {class}"))?;
+        // The object's `running` is read synchronously, so the engine
+        // answers it here, before the object exists. A container a previous
+        // activation on this node left running is adopted by name.
+        if config.container_class(class) {
+            let engine = crate::container::engine().await?;
+            engine.attach(&cell, class).await?;
+        }
         let startup_timing = CellIsolateStartupTiming {
             started: Instant::now(),
             scope: cell.clone(),
@@ -1999,8 +2082,7 @@ impl RuntimeManager {
                 return Err(error);
             }
         };
-        let isolate = residency.slot().clone();
-        let placed_in = isolate.heap_id();
+        let placed_in = residency.slot().heap_id();
 
         // Everything the cell needs that the isolate must do: open its
         // SQLite — which the isolate owns, not the caller — and restore its
@@ -2023,20 +2105,19 @@ impl RuntimeManager {
             },
             None => None,
         };
-        let adopted = isolate
-            .turn(|worker| {
-                worker.own_cell(
-                    &cell,
-                    Some(CellStorage {
-                        path: path_text(&db_path),
-                        epoch,
-                        vfs: paged_vfs.as_deref(),
-                    }),
-                )
-            })
+        let adopted = residency
+            .adopt(
+                &cell,
+                CellStorage {
+                    path: path_text(&db_path),
+                    epoch,
+                    replicated_wake: self.wake.is_some(),
+                    vfs: paged_vfs.as_deref(),
+                },
+            )
             .await;
-        let alarm = match adopted {
-            Ok(alarm) => alarm,
+        let (residency, alarm) = match adopted {
+            Ok(adopted) => adopted,
             Err(error) => {
                 startup_timing.emit("error", "storage_open");
                 return Err(error);
@@ -2057,7 +2138,7 @@ impl RuntimeManager {
                     generation: generation.id,
                     startup_us,
                     residency,
-                    next_alarm_ms: AtomicI64::new(alarm.unwrap_or(-1)),
+                    alarm,
                     requests: Arc::new(CellRequestAdmission {
                         in_flight: AtomicUsize::new(0),
                         saturated: AtomicBool::new(false),
@@ -2111,6 +2192,18 @@ impl RuntimeManager {
         epoch: u64,
         mode: StopMode,
     ) -> anyhow::Result<()> {
+        if let Some(engine) = crate::container::engine_if_ready() {
+            // Only an idle eviction keeps the cell on this node, so only it
+            // keeps the container: the next activation here reconnects.
+            let release = match &mode {
+                StopMode::Evict {
+                    preserve_local: true,
+                    ..
+                } => crate::container::Release::Keep,
+                _ => crate::container::Release::Destroy,
+            };
+            engine.release(cell, release).await;
+        }
         let mut stopped = Vec::new();
         {
             let mut cells = self.cells.lock().expect("cell registry poisoned");
@@ -2165,11 +2258,18 @@ impl RuntimeManager {
             // Passing these as independent booleans let cleanup close a proved
             // remote restore in place, where no later activation could use it.
             match mode {
-                StopMode::Evict { preserve_local } => {
+                StopMode::Evict {
+                    preserve_local,
+                    abandon,
+                } => {
                     // A failed final sync leaves the handle and files in place.
                     // This call is therefore intentionally retryable after the
-                    // runtime itself has already stopped.
-                    replication.evict(cell, epoch, preserve_local).await?;
+                    // runtime itself has already stopped. An abandoned one is
+                    // not: it returns `EvictionAbandoned`, and the caller ends
+                    // the stop instead of trying again.
+                    replication
+                        .evict(cell, epoch, preserve_local, abandon.as_deref())
+                        .await?;
                 }
                 StopMode::Rebase => replication.release(cell, epoch).await?,
                 StopMode::CloseInPlace => replication.close_in_place(cell, epoch).await?,
@@ -2304,20 +2404,28 @@ impl RuntimeManager {
     /// sends is ordered with the reporter's sends: a read taken here cannot
     /// reach the core after a fresher report (see `alarm_reporter`).
     pub fn with_alarm<T>(&self, cell: &str, f: impl FnOnce(Option<i64>) -> T) -> T {
+        self.with_alarm_snapshot(cell, |alarm| f(alarm.at_ms()))
+    }
+
+    fn with_alarm_snapshot<T>(
+        &self,
+        cell: &str,
+        f: impl FnOnce(celld_logic::wake::AlarmSnapshot) -> T,
+    ) -> T {
         let cells = self.cells.lock().expect("cell registry poisoned");
-        let at_ms = cells
+        let alarm = cells
             .published
             .get(cell)
             .or_else(|| cells.starting.get(cell))
-            .map(|handle| handle.next_alarm_ms.load(Ordering::Acquire))
-            .filter(|at_ms| *at_ms >= 0);
-        f(at_ms)
+            .map(|handle| handle.alarm)
+            .unwrap_or_else(|| celld_logic::wake::AlarmSnapshot::without_wake(None));
+        f(alarm)
     }
 
-    pub fn alarm_covered(&self, cell: &str, at_ms: Option<i64>) -> bool {
-        match (at_ms, &self.wake) {
+    pub fn alarm_covered(&self, cell: &str, alarm: celld_logic::wake::AlarmSnapshot) -> bool {
+        match (alarm.at_ms(), &self.wake) {
             (None, _) => true,
-            (Some(at_ms), Some(wake)) if self.replication.is_some() => wake.covered(cell, at_ms),
+            (Some(_), Some(wake)) if self.replication.is_some() => wake.covered(cell, alarm),
             (Some(_), None) => false,
             (Some(_), Some(_)) => false,
         }
@@ -2328,7 +2436,7 @@ impl RuntimeManager {
         op: celld_logic::OpId,
         cell: String,
         scheduled_ms: i64,
-    ) -> anyhow::Result<(Option<i64>, bool, Option<u64>)> {
+    ) -> anyhow::Result<(celld_logic::wake::AlarmSnapshot, bool, Option<u64>)> {
         let request_id = js::next_request_id();
         let cancel = self
             .alarm_requests
@@ -2359,13 +2467,13 @@ impl RuntimeManager {
             js::abort_request_for_shutdown(request_id);
         }
         let result = receive.await.context("cell isolate dropped alarm result")?;
-        let final_write = drive.await.expect("cell alarm drive task panicked");
+        let final_write = drive.await.expect("cell alarm drive task panicked")?;
         // A cancelled or failed alarm settles its claim in the drive's final
         // isolate turn. The event reply is itself held behind every wake-entry
         // arm, so waiting for the drive makes that final cache authoritative
         // before the core sees completion.
         match result {
-            Ok((at_ms, wrote)) => Ok((at_ms, self.alarm_covered(&cell, at_ms), wrote)),
+            Ok((alarm, wrote)) => Ok((alarm, self.alarm_covered(&cell, alarm), wrote)),
             Err(error) => {
                 // The drive completed its final isolate turn before this
                 // branch. Its alarm cache is therefore authoritative even
@@ -2384,10 +2492,10 @@ impl RuntimeManager {
                 // left, so the error carries the whole delta; one that
                 // failed before or between turns had its record written by
                 // the final turn, whose sample is the later one.
-                let at_ms = self.alarm(&cell);
+                let alarm = self.with_alarm_snapshot(&cell, |alarm| alarm);
                 Ok((
-                    at_ms,
-                    self.alarm_covered(&cell, at_ms),
+                    alarm,
+                    self.alarm_covered(&cell, alarm),
                     final_write.max(js::failed_write_position(&error)),
                 ))
             }
@@ -2578,7 +2686,7 @@ impl RuntimeManager {
 }
 
 fn restored_alarm_from_persisted(
-    cell: &str,
+    _cell: &str,
     persisted: Option<(i64, i64, u32, u32)>,
     covered: impl FnOnce(i64) -> bool,
 ) -> Option<celld_logic::RestoredAlarm> {
@@ -2587,28 +2695,10 @@ fn restored_alarm_from_persisted(
         None => -1,
     };
     if at_ms < 0 {
-        // The durable truth this activation just restored has NO alarm —
-        // but a wake entry may still be tracked (the due scan adopts the
-        // entry that woke the cell). That entry disagrees with durable
-        // truth: an arm whose commit never replicated, or a consume whose
-        // delete was lost. Left alone it is immortal — one spurious
-        // activation per waker tick, forever.
-        // Reconciling against the empty truth deletes it; `take_delete`
-        // re-checks at execution time, so an arm racing this activation
-        // cancels the delete.
-        if crate::js::wake_entry_tracked(cell) {
-            let cell_ = cell.to_string();
-            crate::asyncrt::spawn(async move {
-                crate::js::reconcile_wake_entry(&cell_, -1, true).await;
-            })
-            .detach();
-        }
         return None;
     }
-    // The entry this alarm already has in the bucket was written by whoever
-    // armed it, which is not this process once the cell went inactive. Claim
-    // it now, while the alarm is in hand.
-    crate::js::adopt_wake_entry(cell, at_ms);
+    // The restore hint grants no publication or retirement authority. The
+    // opened SQLite connection installs the new writer identity first.
     Some(celld_logic::RestoredAlarm {
         at_ms,
         covered: covered(at_ms),
@@ -2745,6 +2835,32 @@ async fn drive_affiliated_inner(
     // here for the request's whole life, so maintenance cannot free the heap
     // between placement and this first turn or while a promise is suspended.
     let _affiliation = affiliation;
+    drive_worker(
+        &slot,
+        job,
+        trace,
+        budget,
+        |entry| {
+            if let Some(timing) = &mut timing {
+                timing.answered(entry);
+            }
+        },
+        |_| {},
+    )
+    .await;
+}
+
+// Both worker placements use the same execution loop. Keep observation at
+// each turn separate from completion: response timing excludes waitUntil,
+// while the worker-on-cell span includes it. Neither observer owns cleanup.
+async fn drive_worker(
+    slot: &crate::pool::Slot,
+    job: crate::WorkerJob,
+    trace: Option<crate::telemetry::TraceContext>,
+    budget: Duration,
+    mut after_turn: impl FnMut(&js::InFlight),
+    on_finish: impl FnOnce(&js::InFlight),
+) {
     let mut ops = Ops::new();
 
     let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
@@ -2759,9 +2875,7 @@ async fn drive_affiliated_inner(
         drop(started);
         abort_ops(&mut ops, &mut entry);
     }
-    if let Some(timing) = &mut timing {
-        timing.answered(&entry);
-    }
+    after_turn(&entry);
 
     while !entry.finished() {
         let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
@@ -2802,6 +2916,10 @@ async fn drive_affiliated_inner(
                 entry.stuck();
                 Vec::new()
             }
+            Wake::PendingEventIdle => {
+                slot.turn(|worker| worker.turn_cancel_pending_events(&mut entry))
+                    .await
+            }
             Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
         };
         if entry.keeps_native_ops() {
@@ -2810,13 +2928,13 @@ async fn drive_affiliated_inner(
             drop(started);
             abort_ops(&mut ops, &mut entry);
         }
-        if let Some(timing) = &mut timing {
-            timing.answered(&entry);
-        }
+        after_turn(&entry);
     }
 
+    on_finish(&entry);
     // Dropping `ops` aborts whatever is still pending, which is what a region
     // does on every exit path; their resolvers have to go with them.
+    entry.finish_tail_report();
     entry.abandon();
 }
 
@@ -2837,6 +2955,9 @@ enum Wake {
     Expired,
     /// Nothing outstanding could ever move it.
     Idle,
+    /// A nested Worker entrypoint is pending without native work. Reject that
+    /// call inside JavaScript so the enclosing event can catch the failure.
+    PendingEventIdle,
     /// Nothing of its own is outstanding, but another event of the same cell
     /// still could settle it. Look in and see.
     Poll,
@@ -2870,32 +2991,58 @@ async fn wake_with_cross_entry_gate(
 
 async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake {
     loop {
+        // An op this event enqueued from inside another event's turn reaches
+        // this driver here rather than through `adopt`, because the turn that
+        // took it belongs to another entry. See `js::adopt`.
+        adopt(ops, entry.take_handed_ops());
+        // A WorkerEntrypoint call is its own PendingEvent. When no referenced
+        // native operation can move it, reject that call inside JavaScript.
+        // An unreferenced signal listener cannot make progress and must not
+        // hide a hung call. This check precedes the answered branch because
+        // the enclosing handler can keep the call alive through waitUntil
+        // after its response.
+        if !entry.has_refed_ops() && entry.has_pending_events() {
+            return Wake::PendingEventIdle;
+        }
         let Some(left) = entry.remaining(budget) else {
             // The handler settled, so neither its reply gate nor waitUntil
             // work is charged to the handler budget. Poll both because the
             // background can progress while the gate owns the reply.
             let request_id = entry.request_id();
-            if let Some(gated_reply) = entry.gated_reply() {
+            let (gated_reply, context) = entry.gated_reply_and_io_context();
+            if let Some(gated_reply) = gated_reply {
                 let Some(request_id) = request_id else {
-                    if ops.is_empty() {
-                        return Wake::GatedReply(gated_reply.await);
-                    }
-                    return asyncrt::select_biased! {
-                        "a completed gated reply wins a tie with an operation result";
-                        completion = gated_reply => Wake::GatedReply(completion),
-                        result = ops.next() => match result {
-                            Some((op, result)) => Wake::Op(op, result),
-                            None => Wake::Idle,
-                        },
+                    let next = if ops.is_empty() {
+                        asyncrt::select_biased! {
+                            "a completed gated reply wins a tie with an op another turn hands over";
+                            completion = gated_reply => Some(Wake::GatedReply(completion)),
+                            _ = context.handed_ready() => None,
+                        }
+                    } else {
+                        asyncrt::select_biased! {
+                            "a completed gated reply wins a tie with another operation wake";
+                            completion = gated_reply => Some(Wake::GatedReply(completion)),
+                            result = ops.next() => result.map(|(op, result)| Wake::Op(op, result)),
+                            _ = context.handed_ready() => None,
+                        }
                     };
+                    match next {
+                        Some(wake) => return wake,
+                        // A hand-off, or an exhausted stream after its final
+                        // completion; take the mailbox before waiting again.
+                        None => continue,
+                    }
                 };
                 // The domain select is declaration-order biased. A reply that
-                // completed wins over an op, and an op wins over a cancellation
-                // tick, matching every other request wake boundary.
+                // completed wins over an op, a mailbox hand-off wins over a
+                // cancellation tick, and cancellation is sampled immediately
+                // after a mailbox or timer wake so continuous hand-offs cannot
+                // starve it.
                 let next = if ops.is_empty() {
                     asyncrt::select_biased! {
-                        "a completed gated reply wins a tie with a cancellation tick";
+                        "a completed gated reply wins a tie with another request wake";
                         completion = gated_reply => Some(Wake::GatedReply(completion)),
+                        _ = context.handed_ready() => None,
                         _ = asyncrt::sleep(CANCELLATION_TICK) => None,
                     }
                 } else {
@@ -2904,11 +3051,12 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
                         completion = gated_reply => Some(Wake::GatedReply(completion)),
                         next = async {
                             asyncrt::select_biased! {
-                                "an operation result wins a tie with a cancellation tick";
+                                "an operation result wins a tie with another request wake";
                                 result = ops.next() => Some(match result {
                                     Some((op, result)) => Wake::Op(op, result),
                                     None => Wake::Idle,
                                 }),
+                                _ = context.handed_ready() => None,
                                 _ = asyncrt::sleep(CANCELLATION_TICK) => None,
                             }
                         } => next,
@@ -2930,10 +3078,18 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             // disconnect no longer matters, but a lifecycle cancellation
             // must still retire the background work before the runtime stops.
             let Some(request_id) = request_id else {
-                return match ops.next().await {
-                    Some((op, result)) => Wake::Op(op, result),
-                    None => Wake::Idle,
+                let context = entry.io_context();
+                let next = asyncrt::select_biased! {
+                    "an operation result wins a tie with an op another turn hands over";
+                    result = ops.next() => Some(result),
+                    _ = context.handed_ready() => None,
                 };
+                match next {
+                    Some(Some((op, result))) => return Wake::Op(op, result),
+                    Some(None) => return Wake::Idle,
+                    // Handed over; the next pass takes it.
+                    None => continue,
+                }
             };
             let next = if ops.is_empty() {
                 asyncrt::sleep(CANCELLATION_TICK).await;
@@ -2962,7 +3118,12 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
         // one, so the wait is capped and the flag re-read — as the blocking
         // run loop capped its own. The difference is that reading it costs no
         // isolate, so a request enters V8 only once the client has really gone.
-        let capped = if entry.cancellable() {
+        // An unrefed op can wake a handler that awaits it, but it cannot be
+        // the reason this driver stops polling the isolate. A retained signal
+        // listener otherwise hides the empty-op path that lets a loopback
+        // entry make progress, and both events wait on each other forever.
+        let only_unrefed = !ops.is_empty() && !entry.has_refed_ops();
+        let capped = if entry.cancellable() || only_unrefed {
             left.min(CANCELLATION_TICK)
         } else {
             left
@@ -2977,11 +3138,20 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
         //
         // So "waiting on nothing" is a verdict the budget reaches, not one
         // an empty op set proves.
+        let context = entry.io_context();
         if ops.is_empty() {
             if left.is_zero() {
                 return Wake::Idle;
             }
-            tokio::time::sleep(capped.min(CANCELLATION_TICK)).await;
+            // The handed wake belongs on this path too. This entry holds no op
+            // of its own, so without it a handed op waits out the whole
+            // cancellation tick before the next pass can take it — the delay
+            // this branch has no reason to add.
+            asyncrt::select_biased! {
+                "an op another turn hands over wins a tie with the cancellation tick";
+                _ = context.handed_ready() => {},
+                _ = tokio::time::sleep(capped.min(CANCELLATION_TICK)) => {},
+            }
             // Re-read the flag on this path too. A request with nothing
             // outstanding can still have its client hang up, and only the
             // branch below used to look.
@@ -2990,15 +3160,28 @@ async fn wake(ops: &mut Ops, entry: &mut js::InFlight, budget: Duration) -> Wake
             }
             return Wake::Poll;
         }
-        match tokio::time::timeout(capped, ops.next()).await {
-            Ok(Some((op, result))) => return Wake::Op(op, result),
-            Ok(None) => return Wake::Idle,
+        let next = tokio::time::timeout(capped, async {
+            asyncrt::select_biased! {
+                "an operation result wins a tie with an op another turn hands over";
+                result = ops.next() => Some(result),
+                _ = context.handed_ready() => None,
+            }
+        })
+        .await;
+        match next {
+            Ok(Some(Some((op, result)))) => return Wake::Op(op, result),
+            Ok(Some(None)) => return Wake::Idle,
+            // Another turn handed this event an op. The next pass takes it.
+            Ok(None) => continue,
             Err(_) => {
                 if let Some(cancelled) = take_cancellation_wake(entry.request_id()) {
                     return cancelled;
                 }
                 if capped == left {
                     return Wake::Expired;
+                }
+                if only_unrefed {
+                    return Wake::Poll;
                 }
                 continue;
             }
@@ -3271,8 +3454,22 @@ impl StatelessRuntime {
         headers: Vec<(String, String)>,
         cancellation: Option<Arc<RequestCancellationLifetime>>,
     ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send + 'static {
+        self.fetch_target(None, url, method, body, headers, cancellation)
+    }
+
+    /// Serve one default or named stateless Worker entrypoint.
+    fn fetch_target(
+        &self,
+        entrypoint: Option<crate::WorkerFetchEntrypoint>,
+        url: String,
+        method: String,
+        body: js::RequestBody,
+        headers: Vec<(String, String)>,
+        cancellation: Option<Arc<RequestCancellationLifetime>>,
+    ) -> impl std::future::Future<Output = anyhow::Result<HttpResponse>> + Send + 'static {
         let runtime = self.clone();
-        let make_job = stateless_fetch_job_factory(url, method, body, headers, cancellation);
+        let make_job =
+            stateless_fetch_job_factory(entrypoint, url, method, body, headers, cancellation);
         async move {
             let shedding = crate::ownership_store::node_is_shedding();
             runtime
@@ -3291,13 +3488,14 @@ impl StatelessRuntime {
     async fn rpc(
         &self,
         entrypoint: String,
-        method: String,
-        args: Vec<u8>,
+        props: Vec<u8>,
+        operation: crate::WorkerRpcOperation,
     ) -> anyhow::Result<Vec<u8>> {
         self.dispatch(StatelessVerb::Rpc, move |reply| crate::WorkerJob::Rpc {
             entrypoint,
-            method,
-            args,
+            operation,
+            props,
+            invocation_limits: None,
             reply,
         })
         .await
@@ -3370,10 +3568,12 @@ impl CellIsolateStartupTiming {
 /// A count rather than a latch, so a test can prove the retry reaches
 /// success instead of only proving that it never proceeds. `debug_assertions`
 /// is the gate `CELLD_TEST_CELL_STARTUP_FAILURE` beside it already uses: the
-/// runtime matrix drives the shipped debug binary, which no private cfg
+/// runtime matrix drives the debug binary, which no internal test cfg
 /// reaches, and a release build compiles neither.
 #[cfg(debug_assertions)]
 fn injected_swap_release_failure() -> Option<anyhow::Error> {
+    use std::sync::atomic::AtomicI64;
+
     static REMAINING: std::sync::OnceLock<AtomicI64> = std::sync::OnceLock::new();
     let remaining = REMAINING.get_or_init(|| {
         AtomicI64::new(
@@ -3415,79 +3615,27 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let recording = trace.and_then(crate::telemetry::TraceContext::recording_ids);
     let span_started = recording.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
-    let budget = js::handler_budget();
-    let mut ops = Ops::new();
-    let (begun, started) = slot.turn(|worker| worker.turn_begin(job, trace)).await;
-    let Some(mut entry) = begun else {
-        drop(started);
-        return;
-    };
-    if entry.keeps_native_ops() {
-        adopt(&mut ops, started);
-    } else {
-        drop(started);
-        abort_ops(&mut ops, &mut entry);
-    }
-    while !entry.finished() {
-        let started = match wake_with_cross_entry_gate(&mut ops, &mut entry, budget).await {
-            Wake::Op(op, result) => {
-                slot.turn(|worker| worker.turn_deliver(&mut entry, op, result))
-                    .await
+    drive_worker(
+        &slot,
+        job,
+        trace,
+        js::handler_budget(),
+        |_| {},
+        |entry| {
+            if let (Some(ids), Some((started, start_unix))) = (recording, span_started) {
+                let mut span =
+                    crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
+                span.start_unix_us = start_unix;
+                span.duration_us = started.elapsed().as_micros() as i64;
+                span.ok = entry.finished() && entry.failure().is_none();
+                span.error = entry.failure().map(str::to_string);
+                span.parent_span_id = remote.map(|parent| parent.span_id);
+                span.parent_remote = remote.map(|_| true);
+                crate::telemetry::record(span);
             }
-            Wake::GatedReply(completion) => {
-                entry.finish_gated_reply(completion);
-                Vec::new()
-            }
-            Wake::CancelGatedReply => {
-                entry.cancel_gated_reply();
-                Vec::new()
-            }
-            Wake::CrossEntryGateChanged => {
-                entry.finish_cross_entry_gates();
-                Vec::new()
-            }
-            Wake::Cancelled { shutdown } => {
-                let started = slot
-                    .turn(|worker| {
-                        if shutdown {
-                            worker.turn_cancel_for_shutdown(&mut entry)
-                        } else {
-                            worker.turn_cancel(&mut entry)
-                        }
-                    })
-                    .await;
-                entry.cancel_gated_reply();
-                started
-            }
-            Wake::Expired => {
-                entry.time_out(budget);
-                Vec::new()
-            }
-            Wake::Idle => {
-                entry.stuck();
-                Vec::new()
-            }
-            Wake::Poll => slot.turn(|worker| worker.turn_poll(&mut entry)).await,
-        };
-        if entry.keeps_native_ops() {
-            adopt(&mut ops, started);
-        } else {
-            drop(started);
-            abort_ops(&mut ops, &mut entry);
-        }
-    }
-    if let (Some(ids), Some((started, start_unix))) = (recording, span_started) {
-        let mut span =
-            crate::telemetry::Span::new(ids, "celld.fetch", crate::telemetry::KIND_SERVER);
-        span.start_unix_us = start_unix;
-        span.duration_us = started.elapsed().as_micros() as i64;
-        span.ok = entry.finished() && entry.failure().is_none();
-        span.error = entry.failure().map(str::to_string);
-        span.parent_span_id = remote.map(|parent| parent.span_id);
-        span.parent_remote = remote.map(|_| true);
-        crate::telemetry::record(span);
-    }
-    entry.abandon();
+        },
+    )
+    .await;
 }
 
 /// Report a turn's alarm moves to the host.
@@ -3499,7 +3647,10 @@ async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate:
 /// until the alarm fires. The blocking run loop hid this by polling
 /// `get_alarm` between turns and firing a due alarm inline; with events as
 /// entries, the host has to be told as soon as the arming turn returns.
-fn report_alarm_moves(report: &Option<AlarmReporter>, moves: Vec<(String, i64)>) {
+fn report_alarm_moves(
+    report: &Option<AlarmReporter>,
+    moves: Vec<(String, celld_logic::wake::AlarmSnapshot)>,
+) {
     if let Some(report) = report {
         for (scope, at_ms) in moves {
             report(scope, at_ms);
@@ -3525,7 +3676,7 @@ pub async fn drive_cell(
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
     #[cfg(celld_internal_tests)]
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         report,
@@ -3536,7 +3687,7 @@ pub async fn drive_cell(
     )
     .await;
     #[cfg(not(celld_internal_tests))]
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         report,
@@ -3558,7 +3709,7 @@ pub(crate) async fn drive_alarm(
     affiliation: crate::pool::Affiliation,
     job: CellJob,
     report: Option<AlarmReporter>,
-) -> Option<u64> {
+) -> anyhow::Result<Option<u64>> {
     let cancellation = job
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
@@ -3587,7 +3738,7 @@ pub async fn drive_cell_with_budget_for_test(
     let cancellation = job
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         report,
@@ -3612,7 +3763,7 @@ async fn drive_cell_with_request_cancellation(
         "a cell fetch and its cancellation lifetime must have the same request id"
     );
     #[cfg(celld_internal_tests)]
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         report,
@@ -3623,7 +3774,7 @@ async fn drive_cell_with_request_cancellation(
     )
     .await;
     #[cfg(not(celld_internal_tests))]
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         report,
@@ -3644,7 +3795,7 @@ pub async fn drive_cell_observing_gated_failure_for_test(
     let cancellation = job
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         None,
@@ -3670,7 +3821,7 @@ pub async fn drive_cell_observing_gated_op_drop_for_test(
     let cancellation = job
         .request_id()
         .map(RequestCancellationLifetime::from_request_id);
-    drive_cell_inner(
+    let _ = drive_cell_inner(
         affiliation,
         job,
         None,
@@ -3726,7 +3877,7 @@ fn notify_gated_failure_for_test(
     entry: &mut js::InFlight,
     observer: &mut Option<tokio::sync::oneshot::Sender<bool>>,
 ) {
-    let gated = entry.gated_reply().is_some();
+    let gated = entry.gated_reply_and_io_context().0.is_some();
     if let Some(observer) = observer.take() {
         let _ = observer.send(gated);
     }
@@ -3740,19 +3891,19 @@ async fn drive_cell_inner(
     budget: Duration,
     request_cancellation: Option<Arc<RequestCancellationLifetime>>,
     #[cfg(celld_internal_tests)] mut test_observers: DriveCellTestObservers,
-) -> Option<u64> {
+) -> anyhow::Result<Option<u64>> {
     let _request_cancellation = request_cancellation.map(RequestCancellationGuard::shared);
     // Held to the end of this function: the event's claim on the isolate
     // outlives every suspension, so the pool cannot free the worker under
     // a parked event (denoland/celld#147).
     let slot = affiliation.slot().clone();
     let scope = job.scope().to_string();
-    let mut queue_producer = if job.is_queue_producer() {
-        match slot.queue_producer(&scope).await {
+    let _queue_producer = if job.is_queue_producer() {
+        match slot.queue_producer(&scope) {
             Some(permit) => Some(permit),
             None => {
                 job.fail(anyhow!(js::CellOverloaded));
-                return None;
+                return Ok(None);
             }
         }
     } else {
@@ -3840,10 +3991,10 @@ async fn drive_cell_inner(
                         if let Some(job) = pending.take() {
                             job.fail(anyhow!(failure));
                         }
-                        return None;
+                        return Ok(None);
                     }
                     // The cell stopped while this event waited.
-                    Err(_) => return None,
+                    Err(_) => return Ok(None),
                 },
             },
         }
@@ -3857,7 +4008,7 @@ async fn drive_cell_inner(
     // Nothing is in flight; the reply already carries the error.
     let Some(mut entry) = begun else {
         drop(started);
-        return None;
+        return Ok(None);
     };
     if entry.keeps_native_ops() {
         #[cfg(celld_internal_tests)]
@@ -3871,13 +4022,8 @@ async fn drive_cell_inner(
         drop(started);
         abort_ops(&mut ops, &mut entry);
     }
-    if entry.gated_reply().is_some() {
-        if let Some(producer) = queue_producer.as_mut() {
-            producer.reached_reply_gate();
-        }
-    }
     #[cfg(celld_internal_tests)]
-    if entry.gated_reply().is_some() {
+    if entry.gated_reply_and_io_context().0.is_some() {
         notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
     }
 
@@ -3935,6 +4081,13 @@ async fn drive_cell_inner(
                 notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
                 (Vec::new(), Vec::new())
             }
+            Wake::PendingEventIdle => {
+                slot.turn(|worker| {
+                    let started = worker.turn_cancel_pending_events(&mut entry);
+                    (started, worker.take_alarm_moves())
+                })
+                .await
+            }
             Wake::Poll => {
                 slot.turn(|worker| {
                     let started = worker.turn_poll(&mut entry);
@@ -3943,13 +4096,8 @@ async fn drive_cell_inner(
                 .await
             }
         };
-        if entry.gated_reply().is_some() {
-            if let Some(producer) = queue_producer.as_mut() {
-                producer.reached_reply_gate();
-            }
-        }
         #[cfg(celld_internal_tests)]
-        if entry.gated_reply().is_some() {
+        if entry.gated_reply_and_io_context().0.is_some() {
             notify_gated_failure_for_test(&mut entry, &mut test_observers.gated_failure);
         }
         if entry.keeps_native_ops() {
@@ -3971,7 +4119,7 @@ async fn drive_cell_inner(
     // `fail` deliberately leaves the claim, because it runs between turns
     // where cell storage is unreachable (denoland/celld#170) — and
     // recording it is storage only the isolate can reach.
-    let mut alarm_write = None;
+    let mut alarm_write = Ok(None);
     if entry.owes_alarm() {
         let (moves, write) = slot
             .turn(|worker| {
@@ -4006,4 +4154,21 @@ async fn drive_cell_inner(
 
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("celld data path must be UTF-8")
+}
+
+/// Tell the container module which classes the current generation
+/// attaches a container to, and warm their images off the request path.
+/// A generation with no container class installs an empty list, so a
+/// class dropped by a redeploy cannot start a container.
+fn install_container_specs(generation: &Generation) {
+    crate::container::install_specs(
+        generation.containers.clone(),
+        generation.fence_image.clone(),
+    );
+    if generation.containers.is_empty() {
+        return;
+    }
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(crate::container::prewarm());
+    }
 }

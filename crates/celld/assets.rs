@@ -1007,12 +1007,18 @@ fn parse_redirect_rules(value: &str) -> anyhow::Result<Vec<RedirectRule>> {
 }
 
 fn strip_port(host: &str) -> &str {
-    if host.starts_with('[') {
-        return host.find(']').map_or(host, |end| &host[1..end]);
+    let original = host;
+    if let Some(host) = host.strip_prefix('[') {
+        return host.split_once(']').map_or(original, |(host, _)| host);
     }
     host.rsplit_once(':')
         .filter(|(_, port)| port.bytes().all(|byte| byte.is_ascii_digit()))
         .map_or(host, |(host, _)| host)
+}
+
+#[cfg(all(test, celld_internal_tests))]
+mod internal_tests {
+    include!(env!("CELLD_INTERNAL_ASSETS_TESTS"));
 }
 
 fn route(index: &AssetIndex, path: &str, include_not_found: bool) -> Route {

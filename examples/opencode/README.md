@@ -8,7 +8,7 @@ the assistant reply.
 The example needs no credentials. The SDK resolves a free model from its own
 provider registry, and it reports the model that answered.
 
-Install the example dependencies with `npm ci`, then start it:
+Install the example dependencies with `npm install`, then start it:
 
 ```sh
 celld dev .

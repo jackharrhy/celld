@@ -232,11 +232,7 @@ fn flush_pending_puts(scope: &mut v8::PinScope, cell: &str) -> Result<(), String
 /// The promise takes an ordinary gate ticket on its own channel rather than
 /// calling the replicator: the core checks that the proven position covers
 /// the requested one and, for a bucket proof, verifies ownership before it
-/// acks, and a direct replicator call would skip both. With
-/// `CELLD_OUTPUT_GATE=0` the shell releases every ticket without a proof, so
-/// the promise resolves after the local commit: the operator opted out of
-/// proofs for the whole process, and `sync()` follows the same rule as the
-/// response.
+/// acks, and a direct replicator call would skip both.
 ///
 /// The ticket is always a write ticket at the cell's current committed
 /// position, whether or not this event wrote. A read-only ticket trails the
@@ -288,9 +284,10 @@ pub(super) fn op_storage_sync(
         );
         return;
     }
-    let Some(sample) = storage::sync_sample(&cell) else {
-        throw_storage_error(scope, "sync", format!("{cell} is not resident"));
-        return;
+    let sample = match storage::sync_sample(&cell) {
+        Ok(Some(sample)) => sample,
+        Ok(None) => return throw_storage_error(scope, "sync", format!("{cell} is not resident")),
+        Err(error) => return throw_storage_error(scope, "sync", error.to_string()),
     };
     // An open transaction advances the write position before it commits,
     // and the replicator ships only committed frames. A ticket taken here
@@ -319,9 +316,12 @@ pub(super) fn op_storage_sync(
     // for is a proof of a database that contains this facet's writes.
     let gate = match frame.root {
         Some(root) => {
-            storage::flush_embedded(&cell);
+            let flush = storage::flush_embedded(&cell);
             match storage::sql_critical_error(&cell) {
                 Some(error) => EgressGate::Unpersisted(error),
+                None if flush == storage::EmbeddedFlush::Deferred => EgressGate::Unpersisted(
+                    "the root transaction has not committed the facet image".to_string(),
+                ),
                 None => EgressGate::Wrote(
                     root.cell,
                     celld_logic::Channel::Sync,
@@ -376,8 +376,8 @@ pub(super) fn op_sql_ingest(
     };
     rv.set(v8::String::new(scope, &out.to_string()).unwrap().into());
 }
-/// `__sql_cursor_start(cell, query, bindsJson)` — open a native SQL cursor and
-/// hand back its first row.
+/// `__sql_cursor_start(cell, query, bindsJson, byteBinds)` — open a native SQL
+/// cursor and hand back its first row.
 ///
 /// Returns a `v8::Object` with `cursorId`, `columns`, `row`, `rowsWritten` and
 /// `reusedCachedQuery`. A failure throws.
@@ -410,7 +410,7 @@ pub(super) fn op_sql_cursor_start(
     // count against the binds, so an empty default committed a prefix write
     // and then reported a parameter-count mismatch that named nothing the
     // caller had done. Refuse the call before SQLite sees any of it.
-    let binds: Vec<serde_json::Value> =
+    let json_binds: Vec<serde_json::Value> =
         match serde_json::from_str(&args.get(2).to_rust_string_lossy(scope)) {
             Ok(binds) => binds,
             Err(error) => {
@@ -420,7 +420,72 @@ pub(super) fn op_sql_cursor_start(
                 )
             }
         };
-    let result = storage::sql_cursor_start(&cell, &query, &binds);
+    let mut binds: Vec<rusqlite::types::Value> =
+        json_binds.iter().map(storage::json_to_sql).collect();
+    if !args.get(3).is_undefined() {
+        let Ok(entries) = v8::Local::<v8::Array>::try_from(args.get(3)) else {
+            return loader_throw(scope, "sql: byte bindings must be an array");
+        };
+        if entries.length() as usize > binds.len() {
+            return loader_throw(scope, "sql: there are more byte bindings than placeholders");
+        }
+        let mut occupied = HashSet::with_capacity(entries.length() as usize);
+        for entry_offset in 0..entries.length() {
+            let Some(entry) = entries.get_index(scope, entry_offset) else {
+                // V8 has already installed the exception from the property
+                // read. Returning preserves that exception and, critically,
+                // keeps SQLite outside the failed validation path.
+                return;
+            };
+            let Ok(entry) = v8::Local::<v8::Array>::try_from(entry) else {
+                return loader_throw(scope, "sql: each byte binding must be an index/view pair");
+            };
+            if entry.length() != 2 {
+                return loader_throw(scope, "sql: each byte binding must be an index/view pair");
+            }
+            let Some(index_value) = entry.get_index(scope, 0) else {
+                return;
+            };
+            if !index_value.is_number() {
+                return loader_throw(scope, "sql: a byte binding index must be an integer");
+            }
+            let Some(index_number) = index_value.number_value(scope) else {
+                return;
+            };
+            if !index_number.is_finite()
+                || index_number < 0.0
+                || index_number.fract() != 0.0
+                || index_number >= binds.len() as f64
+            {
+                return loader_throw(scope, "sql: a byte binding index is out of range");
+            }
+            let index = index_number as usize;
+            if !occupied.insert(index) {
+                return loader_throw(scope, "sql: a byte binding index is duplicated");
+            }
+            if !json_binds[index].is_null() {
+                return loader_throw(scope, "sql: a byte binding requires a null placeholder");
+            }
+            let Some(value) = entry.get_index(scope, 1) else {
+                return;
+            };
+            let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) else {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            };
+            let Some(buffer) = view.buffer(scope) else {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            };
+            if buffer.was_detached() {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            }
+            let mut bytes = vec![0; view.byte_length()];
+            if view.copy_contents(&mut bytes) != bytes.len() {
+                return loader_throw(scope, "sql: a byte binding value must be a readable view");
+            }
+            binds[index] = rusqlite::types::Value::Blob(bytes);
+        }
+    }
+    let result = storage::sql_cursor_start_values(&cell, &query, &binds);
     if let Some(timing_started) = timing_started {
         let statement = query
             .split_ascii_whitespace()
@@ -830,13 +895,15 @@ impl v8::ValueSerializerImpl for StorageValueDelegate {
 
 impl v8::ValueDeserializerImpl for StorageValueDelegate {}
 
-#[derive(Clone, Default)]
-struct TransientCloneDelegate {
+#[derive(Clone)]
+struct TransientCloneDelegate<'a> {
     wasm_modules: std::rc::Rc<RefCell<Vec<v8::CompiledWasmModule>>>,
     shared_buffers: std::rc::Rc<RefCell<Vec<v8::SharedRef<v8::BackingStore>>>>,
+    host_object_brand: v8::Local<'a, v8::Symbol>,
+    deserializers: Option<v8::Local<'a, v8::Object>>,
 }
 
-impl v8::ValueSerializerImpl for TransientCloneDelegate {
+impl v8::ValueSerializerImpl for TransientCloneDelegate<'_> {
     fn throw_data_clone_error(&self, scope: &mut v8::PinScope, message: v8::Local<v8::String>) {
         let exception = v8::Exception::type_error(scope, message);
         scope.throw_exception(exception);
@@ -863,9 +930,63 @@ impl v8::ValueSerializerImpl for TransientCloneDelegate {
         modules.push(module.get_compiled_module());
         Some(id)
     }
+
+    fn has_custom_host_object(&self, _isolate: &v8::Isolate) -> bool {
+        true
+    }
+
+    fn is_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+    ) -> Option<bool> {
+        object.has(scope, self.host_object_brand.into())
+    }
+
+    fn write_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        object: v8::Local<'s, v8::Object>,
+        serializer: &dyn v8::ValueSerializerHelper,
+    ) -> Option<bool> {
+        let value = object.get(scope, self.host_object_brand.into())?;
+        let Ok(serialize) = value.try_cast::<v8::Function>() else {
+            let message = v8::String::new(scope, "Unsupported object type").unwrap();
+            self.throw_data_clone_error(scope, message);
+            return None;
+        };
+        let data = serialize.call(scope, object.into(), &[])?;
+        serializer.write_uint32(u32::MAX);
+        serializer.write_value(scope.get_current_context(), data)
+    }
 }
 
-impl v8::ValueDeserializerImpl for TransientCloneDelegate {
+impl v8::ValueDeserializerImpl for TransientCloneDelegate<'_> {
+    fn read_host_object<'s>(
+        &self,
+        scope: &mut v8::PinScope<'s, '_>,
+        deserializer: &dyn v8::ValueDeserializerHelper,
+    ) -> Option<v8::Local<'s, v8::Object>> {
+        let mut tag = 0;
+        if !deserializer.read_uint32(&mut tag) || tag != u32::MAX {
+            return None;
+        }
+        let data = deserializer.read_value(scope.get_current_context())?;
+        let object = data.to_object(scope)?;
+        let key = v8::String::new(scope, "type").unwrap();
+        let clone_type = object.get(scope, key.into())?;
+        let revive = self.deserializers?.get(scope, clone_type)?;
+        let Ok(revive) = revive.try_cast::<v8::Function>() else {
+            let message = v8::String::new(scope, "Unsupported clone data type").unwrap();
+            scope.throw_exception(v8::Exception::error(scope, message));
+            return None;
+        };
+        let receiver = v8::null(scope).into();
+        let allow = std::pin::pin!(v8::AllowJavascriptExecutionScope::new(scope));
+        let scope = &mut allow.init();
+        revive.call(scope, receiver, &[data])?.to_object(scope)
+    }
+
     fn get_shared_array_buffer_from_id<'s>(
         &self,
         scope: &mut v8::PinScope<'s, '_>,
@@ -910,7 +1031,7 @@ fn serialize_storage_value(
     Some(bytes)
 }
 
-fn deserialize_storage_value<'s>(
+pub(super) fn deserialize_storage_value<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     value: storage::StoredValue,
 ) -> Option<v8::Local<'s, v8::Value>> {
@@ -1008,7 +1129,22 @@ pub(super) fn op_structured_clone(
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let scope = &mut tc.init();
     let context = scope.get_current_context();
-    let delegate = TransientCloneDelegate::default();
+    let Ok(host_object_brand) = args.get(1).try_cast::<v8::Symbol>() else {
+        let message = v8::String::new(scope, "structured clone host brand is invalid").unwrap();
+        scope.throw_exception(v8::Exception::type_error(scope, message));
+        return;
+    };
+    let Ok(deserializers) = args.get(2).try_cast::<v8::Object>() else {
+        let message = v8::String::new(scope, "structured clone deserializers are invalid").unwrap();
+        scope.throw_exception(v8::Exception::type_error(scope, message));
+        return;
+    };
+    let delegate = TransientCloneDelegate {
+        wasm_modules: Default::default(),
+        shared_buffers: Default::default(),
+        host_object_brand,
+        deserializers: None,
+    };
     let bytes = {
         let serializer = v8::ValueSerializer::new(scope, Box::new(delegate.clone()));
         serializer.write_header();
@@ -1027,7 +1163,14 @@ pub(super) fn op_structured_clone(
         }
         serializer.release()
     };
-    let deserializer = v8::ValueDeserializer::new(scope, Box::new(delegate), &bytes);
+    let deserializer = v8::ValueDeserializer::new(
+        scope,
+        Box::new(TransientCloneDelegate {
+            deserializers: Some(deserializers),
+            ..delegate
+        }),
+        &bytes,
+    );
     if !deserializer.read_header(context).unwrap_or(false) {
         if !scope.has_caught() {
             let message = v8::String::new(scope, "structured clone header is invalid").unwrap();

@@ -67,16 +67,16 @@ fn insert(id: u64, stream: Duplex) {
 
 /// Mozilla's roots, the same choice `ws_client` makes and for the same
 /// reason: a downloaded celld must reach TLS hosts on a machine with no
-/// `/etc/ssl/certs`. The private suite's TLS servers present certs from
-/// a test root, injected through the gated seam below.
+/// `/etc/ssl/certs`. Test TLS servers use a root injected through the
+/// gated seam below.
 #[cfg(celld_internal_tests)]
 fn test_root() -> &'static Mutex<Option<Vec<u8>>> {
     static ROOT: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
     ROOT.get_or_init(Default::default)
 }
 
-/// Trust one extra DER root for outbound TLS, so the private suite's
-/// self-signed servers verify. No compatibility guarantee.
+/// Trust one extra DER root for outbound TLS, so test servers with
+/// self-signed certificates verify. No compatibility guarantee.
 #[cfg(celld_internal_tests)]
 #[doc(hidden)]
 pub fn test_extra_tls_root(der: Vec<u8>) {
@@ -133,11 +133,23 @@ pub(super) fn op_tcp_connect(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
+    match &actor_runtime_state(scope).egress {
+        EgressPolicy::Allow => {}
+        EgressPolicy::Deny => {
+            return loader_throw(
+                scope,
+                "This worker is not permitted to access the internet via global functions.",
+            );
+        }
+        // A Fetcher is still an authority boundary for sockets. celld's
+        // service protocol has no bidirectional CONNECT tunnel, so refusing is
+        // required: a direct TcpStream here would silently bypass the broker.
+        EgressPolicy::Broker(_) => {
+            return loader_throw(
+                scope,
+                "A globalOutbound Fetcher cannot broker connect() in celld.",
+            );
+        }
     }
     let raw = args.get(0).to_rust_string_lossy(scope);
     let request: ConnectArgs = match serde_json::from_str(&raw) {
@@ -148,7 +160,9 @@ pub(super) fn op_tcp_connect(
     // can own the socket even if the event ends mid-connect.
     let id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(id);
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
         let stream = tokio::net::TcpStream::connect((request.hostname.as_str(), request.port))
             .await
             .map_err(|error| {
@@ -209,7 +223,9 @@ pub(super) fn op_tcp_write(
         return loader_throw(scope, "socket write needs bytes");
     };
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
         let write = guard.as_mut().ok_or("socket is closed")?;
@@ -233,7 +249,9 @@ pub(super) fn op_tcp_shutdown(
 ) {
     let id = args.get(0).integer_value(scope).unwrap_or(0) as u64;
     let half = registry().lock().unwrap().get(&id).map(|s| s.write.clone());
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
         let half = half.ok_or("socket is closed")?;
         let mut guard = half.lock().await;
         let write = guard.as_mut().ok_or("socket is closed")?;
@@ -271,12 +289,15 @@ pub(super) fn op_tcp_starttls(
         Ok(request) => request,
         Err(error) => return loader_throw(scope, &format!("startTls(): {error}")),
     };
-    // The plaintext socket is consumed: remove it so its old id fails
-    // every later op instead of leaking unencrypted bytes.
-    let taken = registry().lock().unwrap().remove(&request.id);
     let new_id = next_id();
     current_context().tcp_sockets.lock().unwrap().push(new_id);
+    let gate = egress_gate_request(&event_context(scope), celld_logic::Channel::Tcp);
     let async_id = asyncrt::enqueue(async move {
+        await_egress_gate(gate).await?;
+        // The plaintext socket remains registered while the gate waits so the
+        // event cleanup can close it. Consume it only when the TLS handshake can
+        // start, and make every later operation on the old id fail.
+        let taken = registry().lock().unwrap().remove(&request.id);
         let socket = taken.ok_or("socket is closed")?;
         let read = socket.read.lock().await.take().ok_or("socket is closed")?;
         let write = socket.write.lock().await.take().ok_or("socket is closed")?;

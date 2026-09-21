@@ -283,10 +283,148 @@ where
 /// and at eight in flight the 2026-09-03 restart spent 388 s of its 403 s
 /// recovery in this phase; the bucket takes far more in flight than that.
 const RECOVERY_UPLOAD_CONCURRENCY: usize = 32;
+/// How many bytes of retained bundles one recovery gather window reads
+/// before it folds that window's rows into the per-cell layout and releases
+/// them. The whole-session gather held every row of every retained bundle
+/// until the last bundle was read: about 0.95 GB of process memory per GB
+/// of session, 7 GB for a ten-minute session at 2 MiB writes, and past 15 GB
+/// the kernel OOM cascade of #964, where each killed gatherer became the
+/// next dead session (#957). The fold holds at most about twice this budget
+/// (the window's rows plus the per-cell merges in flight), whatever the
+/// session's age. The cost is one L0 object per cell for each window the
+/// cell has rows in, instead of one for the whole session; a session under
+/// the budget folds exactly as before.
+const RECOVERY_GATHER_WINDOW_BYTES: u64 = 512 * 1024 * 1024;
 /// Per-cell coverage reads of the graceful seal and the uncovered-row scan
 /// stay below a small fleet's cell count, so a close does not fan out one
 /// listing per cell at once.
 const COVERAGE_READ_CONCURRENCY: usize = 16;
+const BUNDLE_ROW_INDEX_CAPACITY: usize = 512;
+const BUNDLE_GC_EXAMINED_PER_TICK: usize = 512;
+
+struct IndexedBundle {
+    cells: BTreeSet<String>,
+    rows: Option<Vec<celld_ltx::bundle::BundleRow>>,
+}
+
+#[derive(Default)]
+struct BundleIndex {
+    bundles: BTreeMap<String, IndexedBundle>,
+    by_cell: BTreeMap<String, BTreeSet<String>>,
+    recent: std::collections::VecDeque<String>,
+    /// The highest txid whose row metadata left `recent`, per cell epoch. A
+    /// cell needs its evicted bundles only until its per-cell coverage passes
+    /// this cut, so a covered cell costs no bundle read.
+    evicted: BTreeMap<(String, u64), u64>,
+}
+
+/// One cell epoch's view of the index. The rows, the evicted bundles, and
+/// their cut come from one lock: an eviction between two reads could drop a
+/// bundle from both the rows and the evicted set.
+struct CellBundleRows {
+    located: Vec<celld_ltx::LocatedRow>,
+    evicted: Vec<String>,
+    evicted_through: Option<u64>,
+}
+
+impl BundleIndex {
+    fn insert(&mut self, key: String, rows: Vec<celld_ltx::bundle::BundleRow>) {
+        let cells: BTreeSet<String> = rows.iter().map(|row| row.cell.clone()).collect();
+        for cell in &cells {
+            self.by_cell
+                .entry(cell.clone())
+                .or_default()
+                .insert(key.clone());
+        }
+        self.recent.push_back(key.clone());
+        let previous = self.bundles.insert(
+            key.clone(),
+            IndexedBundle {
+                cells,
+                rows: Some(rows),
+            },
+        );
+        debug_assert!(
+            previous.is_none(),
+            "bundle keys are unique within a session"
+        );
+        while self.recent.len() > BUNDLE_ROW_INDEX_CAPACITY {
+            let oldest = self
+                .recent
+                .pop_front()
+                .expect("an over-capacity bundle row index is not empty");
+            let rows = self
+                .bundles
+                .get_mut(&oldest)
+                .and_then(|bundle| bundle.rows.take());
+            for row in rows.into_iter().flatten() {
+                let through = self.evicted.entry((row.cell, row.cell_epoch)).or_default();
+                *through = (*through).max(row.txid);
+            }
+        }
+    }
+
+    fn rows(&self, key: &str) -> Option<Vec<celld_ltx::bundle::BundleRow>> {
+        self.bundles.get(key).and_then(|bundle| bundle.rows.clone())
+    }
+
+    fn bundles_for(&self, cell: &str) -> Vec<(String, Option<Vec<celld_ltx::bundle::BundleRow>>)> {
+        self.by_cell.get(cell).map_or_else(Vec::new, |keys| {
+            keys.iter()
+                .filter_map(|key| {
+                    self.bundles
+                        .get(key)
+                        .map(|bundle| (key.clone(), bundle.rows.clone()))
+                })
+                .collect()
+        })
+    }
+
+    fn cell_rows(&self, cell: &str, epoch: u64) -> CellBundleRows {
+        let mut located = Vec::new();
+        let mut evicted = Vec::new();
+        for key in self.by_cell.get(cell).into_iter().flatten() {
+            let Some(bundle) = self.bundles.get(key) else {
+                continue;
+            };
+            match &bundle.rows {
+                Some(rows) => located.extend(
+                    rows.iter()
+                        .filter(|row| row.cell == cell && row.cell_epoch == epoch)
+                        .map(|row| celld_ltx::LocatedRow {
+                            source: key.clone(),
+                            row: row.clone(),
+                        }),
+                ),
+                None => evicted.push(key.clone()),
+            }
+        }
+        CellBundleRows {
+            located,
+            evicted,
+            evicted_through: self.evicted.get(&(cell.to_string(), epoch)).copied(),
+        }
+    }
+
+    fn remove(&mut self, keys: &[String]) {
+        let removed: BTreeSet<&str> = keys.iter().map(String::as_str).collect();
+        for key in &removed {
+            let Some(bundle) = self.bundles.remove(*key) else {
+                continue;
+            };
+            for cell in bundle.cells {
+                let empty = self.by_cell.get_mut(&cell).is_some_and(|cell_keys| {
+                    cell_keys.remove(*key);
+                    cell_keys.is_empty()
+                });
+                if empty {
+                    self.by_cell.remove(&cell);
+                }
+            }
+        }
+        self.recent.retain(|key| !removed.contains(key.as_str()));
+    }
+}
 
 /// A contender observes a live recovery before it tries to replace it. The
 /// node-log tail is bounded to the flush window, so thirty seconds is enough
@@ -1864,6 +2002,49 @@ impl FollowerStore {
     }
 }
 
+/// Flush order of a retained bundle key, `log/<session>/bundle/e<epoch>-<seq>.ltxb`,
+/// as the numeric (epoch, seq) pair: the shipper's sequence counter is
+/// monotonic for the session and the epoch only rises, so this is the order
+/// the rows were captured in. A key sort is not: `e10-` sorts before `e9-`.
+/// A key that does not parse sorts last, after every bundle the shipper
+/// named, so a foreign object under the prefix cannot move a real bundle.
+fn bundle_flush_order(key: &str) -> (u64, u64, String) {
+    let parsed = key
+        .rsplit('/')
+        .next()
+        .and_then(|name| name.strip_prefix('e'))
+        .and_then(|name| name.strip_suffix(".ltxb"))
+        .and_then(|name| name.split_once('-'))
+        .and_then(|(epoch, seq)| Some((epoch.parse::<u64>().ok()?, seq.parse::<u64>().ok()?)));
+    match parsed {
+        Some((epoch, seq)) => (epoch, seq, String::new()),
+        None => (u64::MAX, u64::MAX, key.to_string()),
+    }
+}
+
+/// Split the listed bundles, `(key, size)`, into the gather windows of a
+/// recovery: consecutive bundles in flush order whose sizes sum to at most
+/// `budget`. A bundle larger than the budget is a window of its own, so the
+/// fold always advances, and an empty listing is one empty window, so the
+/// follower tails still fold. The listing's size is the bound on the rows a
+/// window's bundles can carry, so the plan needs no read.
+fn gather_windows(mut bundles: Vec<(String, u64)>, budget: u64) -> Vec<Vec<String>> {
+    bundles.sort_by_cached_key(|(key, _)| bundle_flush_order(key));
+    let mut windows: Vec<Vec<String>> = vec![Vec::new()];
+    let mut held = 0_u64;
+    for (key, size) in bundles {
+        let open = windows.last_mut().expect("a gather window is always open");
+        if !open.is_empty() && held.saturating_add(size) > budget {
+            windows.push(vec![key]);
+            held = size;
+        } else {
+            open.push(key);
+            held = held.saturating_add(size);
+        }
+    }
+    windows
+}
+
 fn tail_covers_sealed_range(base: u64, end: u64, entries: &[Entry]) -> bool {
     if base > end {
         return false;
@@ -3342,18 +3523,15 @@ pub struct NodeLogManager {
     /// The current ensemble's shipper, swapped whole by the maintenance
     /// loop. The manager itself is the installed `Shipper`, delegating here.
     inner: Mutex<Option<Arc<FleetShipper>>>,
-    /// The record epoch THIS incarnation CASed open (0 = none). An open
-    /// record at any other epoch belongs to a previous incarnation and must
-    /// be recovered — its acked tail may exist only on the old followers —
-    /// before the maintenance loop may step past it.
-    /// Bundle the paced tiering (`CELLD_LOG_BUNDLE`): one PUT per node per
-    /// flush interval instead of one per cell-transaction.
-    bundle_mode: bool,
     bundle_seq: std::sync::atomic::AtomicU64,
-    /// The leader's own index of the bundles it wrote this run:
-    /// (object key, rows). Bounded; a restart loses it safely, because
-    /// self-recovery folds the previous incarnation's bundles anyway.
-    bundle_index: Mutex<std::collections::VecDeque<(String, Vec<celld_ltx::bundle::BundleRow>)>>,
+    /// The leader's own index of the bundles it wrote this run. Cell
+    /// membership stays complete for the process session, while full row
+    /// metadata stays bounded. A restart loses the index safely because it
+    /// creates a new session and recovers the previous session as one unit.
+    bundle_index: Mutex<BundleIndex>,
+    /// Resume after examined bundles, including those not yet covered.
+    /// Serialize passes so overlapping callers cannot move the cursor back.
+    bundle_gc_cursor: tokio::sync::Mutex<Option<String>>,
     /// Sessions whose bundle subtree one sweep pass confirmed empty:
     /// a permanent tombstone (dead-lease GC never deletes a folded
     /// record) must not cost a bundle LIST on every sweep tick forever
@@ -3399,6 +3577,14 @@ pub struct NodeLogManager {
     maintenance_publish_pause: Mutex<Option<Arc<NodeLogTransitionPause>>>,
     #[cfg(all(test, celld_internal_tests))]
     shipper_injection_calls: std::sync::atomic::AtomicU64,
+    /// The gather window budget. A test override lowers it to fold a
+    /// small session in several windows.
+    #[cfg(all(test, celld_internal_tests))]
+    recovery_gather_window_bytes: std::sync::atomic::AtomicU64,
+    /// The most row bytes one gather window held at once, the measure of
+    /// the memory a recovery costs.
+    #[cfg(all(test, celld_internal_tests))]
+    recovery_gather_peak_bytes: std::sync::atomic::AtomicU64,
     /// Every predecessor session's log is proven recovered; see
     /// `ensure_predecessors_recovered` for why this can latch.
     predecessors_clean: std::sync::atomic::AtomicBool,
@@ -3450,34 +3636,21 @@ impl DurabilityOwner {
     /// Creates the unique owner for a runtime durability stack.
     ///
     /// Set `fleet` to install the coupled node-log registration.
-    /// `bundle_mode` enables the LTX bundle sink when `fleet` is `true`.
+    /// The fleet shipper and bundle sink are always installed together.
     ///
     /// # Panics
     ///
     /// The function panics if another owner controls the LTX task set. It also
     /// panics if a fleet registration targets a stopped LTX service.
-    pub fn new(manager: Arc<NodeLogManager>, fleet: bool, bundle_mode: bool) -> Self {
-        let shipper = manager.clone();
-        Self::new_with_shipper(manager, fleet, bundle_mode, shipper)
-    }
-
-    fn new_with_shipper(
-        manager: Arc<NodeLogManager>,
-        fleet: bool,
-        bundle_mode: bool,
-        shipper: Arc<dyn crate::ltx_repl::Shipper>,
-    ) -> Self {
+    pub fn new(manager: Arc<NodeLogManager>, fleet: bool) -> Self {
         let ltx = manager.ltx.clone();
         // Claim the unique lifecycle capability before changing the coupled
         // registration. A duplicate construction fails here, so its unwind
         // cannot supersede and then clear the live owner's generation.
         let ltx_tasks = ltx.take_task_owner();
         let registration = fleet.then(|| {
-            ltx.register_durability(
-                shipper,
-                bundle_mode.then(|| manager.clone() as Arc<dyn crate::ltx_repl::BundleSink>),
-            )
-            .expect("a new durability owner cannot install on a stopped LTX service")
+            ltx.register_durability(manager.clone())
+                .expect("a new durability owner cannot install on a stopped LTX service")
         });
         Self::from_claimed_registration(manager, fleet, ltx, ltx_tasks, registration)
     }
@@ -3489,13 +3662,18 @@ impl DurabilityOwner {
     pub(crate) fn new_with_shipper_for_world(
         manager: Arc<NodeLogManager>,
         fleet: bool,
-        bundle_mode: bool,
         shipper: Arc<dyn crate::ltx_repl::Shipper>,
     ) -> Self {
         manager
             .shipper_injection_calls
             .fetch_add(1, Ordering::SeqCst);
-        Self::new_with_shipper(manager, fleet, bundle_mode, shipper)
+        let ltx = manager.ltx.clone();
+        let ltx_tasks = ltx.take_task_owner();
+        let registration = fleet.then(|| {
+            ltx.register_durability_for_world(manager.clone(), shipper)
+                .expect("a new durability owner cannot install on a stopped LTX service")
+        });
+        Self::from_claimed_registration(manager, fleet, ltx, ltx_tasks, registration)
     }
 
     fn from_claimed_registration(
@@ -3815,7 +3993,6 @@ impl NodeLogManager {
         own_log: Arc<OwnLog>,
         ltx: Arc<crate::ltx_repl::LtxRepl>,
         auth: Arc<PeerAuth>,
-        bundle_mode: bool,
         policy: celld_logic::log_evict::EvictionPolicy,
     ) -> Self {
         Self::new_with_log_transport(
@@ -3824,7 +4001,6 @@ impl NodeLogManager {
             own_log,
             ltx,
             Arc::new(SignedPeerTransport::new(auth)),
-            bundle_mode,
             policy,
         )
     }
@@ -3836,18 +4012,9 @@ impl NodeLogManager {
         own_log: Arc<OwnLog>,
         ltx: Arc<crate::ltx_repl::LtxRepl>,
         transport: Arc<dyn LogTransport>,
-        bundle_mode: bool,
         policy: celld_logic::log_evict::EvictionPolicy,
     ) -> Self {
-        Self::new_with_log_transport(
-            session,
-            bucket,
-            own_log,
-            ltx,
-            transport,
-            bundle_mode,
-            policy,
-        )
+        Self::new_with_log_transport(session, bucket, own_log, ltx, transport, policy)
     }
 
     fn new_with_log_transport(
@@ -3856,7 +4023,6 @@ impl NodeLogManager {
         own_log: Arc<OwnLog>,
         ltx: Arc<crate::ltx_repl::LtxRepl>,
         transport: Arc<dyn LogTransport>,
-        bundle_mode: bool,
         policy: celld_logic::log_evict::EvictionPolicy,
     ) -> Self {
         let ownership = own_log.ownership.clone();
@@ -3872,9 +4038,9 @@ impl NodeLogManager {
             ltx,
             transport,
             inner: Mutex::new(None),
-            bundle_mode,
             bundle_seq: std::sync::atomic::AtomicU64::new(0),
-            bundle_index: Mutex::new(std::collections::VecDeque::new()),
+            bundle_index: Mutex::new(BundleIndex::default()),
+            bundle_gc_cursor: tokio::sync::Mutex::new(None),
             bundle_cache: tokio::sync::Mutex::new(None),
             health: Arc::new(Mutex::new(celld_logic::log_evict::FollowerHealth::default())),
             policy: Arc::new(policy),
@@ -3890,6 +4056,12 @@ impl NodeLogManager {
             maintenance_publish_pause: Mutex::new(None),
             #[cfg(all(test, celld_internal_tests))]
             shipper_injection_calls: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(all(test, celld_internal_tests))]
+            recovery_gather_window_bytes: std::sync::atomic::AtomicU64::new(
+                RECOVERY_GATHER_WINDOW_BYTES,
+            ),
+            #[cfg(all(test, celld_internal_tests))]
+            recovery_gather_peak_bytes: std::sync::atomic::AtomicU64::new(0),
             predecessors_clean: std::sync::atomic::AtomicBool::new(false),
             recovery_locks: Mutex::new(BTreeMap::new()),
             gc_confirmed_empty: Mutex::new(std::collections::HashSet::new()),
@@ -4158,19 +4330,17 @@ impl NodeLogManager {
     /// segment (per-row fallback for non-contiguous chains), skipping
     /// rows the per-cell watermark already covers. Shared by recovery's
     /// gather and the reopen healing pass. Any failure propagates —
-    /// callers must not seal past an incomplete fold.
+    /// callers must not seal past an incomplete fold. A recovery passes
+    /// its claim and its progress record, which carries the watermarks
+    /// from one gather window to the next.
     async fn upload_gathered(
         &self,
         gathered: BTreeMap<(String, u64, u64), Vec<u8>>,
-        mut claim: Option<(&str, &mut ClaimBeat)>,
+        mut claim: Option<(&str, &mut ClaimBeat, &mut recovery_progress::Progress)>,
     ) -> anyhow::Result<usize> {
         if gathered.is_empty() {
             return Ok(0);
         }
-        let mut progress = match claim.as_mut() {
-            Some((dead, beat)) => Some(recovery_progress::Progress::load(self, dead, beat).await?),
-            None => None,
-        };
         type CellRows = Vec<(u64, Vec<u8>)>;
         let mut groups: BTreeMap<(String, u64), CellRows> = BTreeMap::new();
         for ((cell, cell_epoch, txid), bytes) in gathered {
@@ -4179,7 +4349,7 @@ impl NodeLogManager {
                 .or_default()
                 .push((txid, bytes));
         }
-        if let Some(progress) = &progress {
+        if let Some((_, _, progress)) = claim.as_ref() {
             groups.retain(|(cell, epoch), rows| {
                 if let Some(through) = progress.through(cell, *epoch) {
                     rows.retain(|(txid, _)| *txid > through);
@@ -4249,10 +4419,8 @@ impl NodeLogManager {
         while let Some(uploaded) = futures_util::StreamExt::next(&mut uploads).await {
             let (cell, uploaded) = uploaded?;
             count += uploaded;
-            if let Some(progress) = progress.as_mut() {
+            if let Some((dead, beat, progress)) = claim.as_mut() {
                 progress.completed(&self.bucket, cell).await;
-            }
-            if let Some((dead, beat)) = claim.as_mut() {
                 self.beat_claim(dead, beat).await?;
             }
         }
@@ -4557,72 +4725,17 @@ impl NodeLogManager {
                 }
             }
             let members_ms = mono_ms().saturating_sub(pass_started);
-            // The dead leader's un-drained bundles are bucket-durable
-            // coverage that recovery folds into the per-cell prefixes —
-            // one GET per bundle, sliced locally, the same idempotent
-            // per-cell PUTs as the follower gather. This runs regardless
-            // of the witness outcome: even a declared loss drains what
-            // the bucket already holds. EVERY retained bundle, not only
-            // the record epoch's: a live reconfiguration steps the epoch
-            // behind a barrier that counts bundle coverage as tiered, so
-            // rows can be durable only in a prior epoch's bundle — an
-            // epoch filter here sealed them out of the per-cell layout
-            // forever (the RecoveryEpochFilter tooth). What bounds this
-            // gather to the true un-drained window is bundle GC deleting
-            // covered bundles, not a filter that can orphan acked rows;
-            // the covered-txid check below still bounds the uploads.
-            // Concurrent GETs: the profiling round measured the serial
-            // gather at 89-112 s over ~1,300 bundles — the whole outage.
-            // Order does not matter: a row duplicated across bundles
-            // carries identical bytes (same cell, epoch, txid), and
-            // or_insert keeps follower-gathered bytes authoritative.
-            let bundle_metas = self
-                .bucket
-                .list(&format!("log/{dead}/bundle/"))
-                .await
-                .with_context(|| format!("list retained recovery bundles for {dead}"))?;
-            let bundles_read = bundle_metas.len();
-            let fetches = bundle_metas.into_iter().map(|meta| {
-                let bucket = self.bucket.clone();
-                async move {
-                    let key = meta.location.as_ref().to_string();
-                    let fetched = bucket
-                        .get(&key)
-                        .await
-                        .with_context(|| format!("read retained recovery bundle {key}"))?;
-                    let (bytes, _) = fetched
-                        .ok_or_else(|| anyhow!("listed recovery bundle {key} disappeared"))?;
-                    anyhow::Ok((key, bytes))
-                }
-            });
-            let mut fetches =
-                futures_util::stream::iter(fetches).buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY);
-            while let Some(fetched) = futures_util::StreamExt::next(&mut fetches).await {
-                self.beat_claim(dead, &mut beat).await?;
-                let (key, bytes) = fetched?;
-                let rows = celld_ltx::bundle::decode_rows(&bytes)
-                    .with_context(|| format!("decode retained recovery bundle {key}"))?;
-                for row in rows {
-                    let payload = celld_ltx::bundle::slice(&bytes, &row)
-                        .with_context(|| format!("read a row from recovery bundle {key}"))?;
-                    gathered
-                        .entry((row.cell.clone(), row.cell_epoch, row.txid))
-                        .or_insert_with(|| payload.to_vec());
-                }
-            }
-            drop(fetches);
-
-            let bundles_ms = mono_ms()
-                .saturating_sub(pass_started)
-                .saturating_sub(members_ms);
             // `active` was CASed before the first fleet ack of this epoch was
             // credited, so no complete witness plus active means that acked
             // frames can be missing. If any member's state remains
             // inconclusive, keep failing loudly because its data can still
             // become readable. If every member is conclusive, declare the
             // bounded loss AS A RECORD: a permanent object beside the log
-            // record stating what was unrecoverable, then seal and proceed.
-            // "Loss is a record, never a prompt."
+            // record stating what was unrecoverable, then proceed to the
+            // drain and the seal. "Loss is a record, never a prompt." The
+            // verdict rests on the members alone, so it is reached before
+            // the bundle drain: a pass that must refuse to seal refuses
+            // before it reads the session, not after.
             if complete_witnesses == 0 && active && !record.ensemble.is_empty() {
                 anyhow::ensure!(
                     inconclusive == 0,
@@ -4653,20 +4766,143 @@ impl NodeLogManager {
                      recovery record written"
                 );
             }
-            // Skip rows the drain points already folded into the per-cell
-            // prefix: one listing per level and cell bounds uploads to the true
-            // un-drained tail, so recovery cost tracks the flush window,
-            // not the epoch's age. LTX TXIDs are contiguous per epoch, so
-            // coverage up to the listed maximum is coverage of everything
-            // at or below it. Cells drive concurrently — the sequential
-            // version cost the lab ~47 s for 180 entries — while rows
-            // within a cell stay ordered; any failure aborts the pass
-            // before the record can seal.
-            let upload_started = mono_ms();
-            let count = self
-                .upload_gathered(gathered, Some((dead, &mut beat)))
-                .await?;
-            let upload_ms = mono_ms().saturating_sub(upload_started);
+            // The dead leader's un-drained bundles are bucket-durable
+            // coverage that recovery folds into the per-cell prefixes —
+            // one GET per bundle, sliced locally, the same idempotent
+            // per-cell PUTs as the follower gather. This runs regardless
+            // of the witness outcome: even a declared loss drains what
+            // the bucket already holds. EVERY retained bundle, not only
+            // the record epoch's: a live reconfiguration steps the epoch
+            // behind a barrier that counts bundle coverage as tiered, so
+            // rows can be durable only in a prior epoch's bundle — an
+            // epoch filter here sealed them out of the per-cell layout
+            // forever (the RecoveryEpochFilter tooth). What bounds this
+            // gather to the true un-drained window is bundle GC deleting
+            // covered bundles, not a filter that can orphan acked rows;
+            // the covered-txid check in the upload still bounds the
+            // uploads. Concurrent GETs: the profiling round measured the
+            // serial gather at 89-112 s over ~1,300 bundles — the whole
+            // outage.
+            //
+            // The bundles fold in WINDOWS of `RECOVERY_GATHER_WINDOW_BYTES`,
+            // each read, uploaded per cell, and released before the next is
+            // read, so the process holds one window of the session and not
+            // the session (#957: the whole-session gather cost 0.95 GB of
+            // process memory per GB of session and OOM-killed a 16 GB node
+            // past a 40-minute session). Windows make the fold ORDER-
+            // DEPENDENT where the whole-session gather was not: a window
+            // raises the per-cell watermark to the last txid it uploads,
+            // and every later window skips rows at or below it, which is
+            // correct only if every later window's rows for a cell epoch
+            // lie at or above that txid. Flush order guarantees this: the
+            // shipper reads each cell from its durable txid upward, so
+            // consecutive bundles carry adjacent ranges (a credited flush)
+            // or a repeat that extends the earlier one (an uncredited
+            // flush re-read from the same durable txid), and never a lower
+            // range. Flush order is numeric (epoch, seq) order — a key sort
+            // puts `e10-` before `e9-` — and the follower tails, the newest
+            // acked rows of the current epoch, fold with the LAST window;
+            // folded first, their txids would have raised the watermark
+            // over every bundled row behind them and orphaned the session.
+            let bundle_metas = self
+                .bucket
+                .list(&format!("log/{dead}/bundle/"))
+                .await
+                .with_context(|| format!("list retained recovery bundles for {dead}"))?;
+            let bundles_read = bundle_metas.len();
+            #[cfg(all(test, celld_internal_tests))]
+            let window_bytes = self.recovery_gather_window_bytes.load(Ordering::SeqCst);
+            #[cfg(not(all(test, celld_internal_tests)))]
+            let window_bytes = RECOVERY_GATHER_WINDOW_BYTES;
+            let windows = gather_windows(
+                bundle_metas
+                    .into_iter()
+                    .map(|meta| (meta.location.as_ref().to_string(), meta.size))
+                    .collect(),
+                window_bytes,
+            );
+            let window_count = windows.len();
+            // Loaded ahead of the first upload, as before the windows: a
+            // session with nothing to fold costs no checkpoint listing.
+            let mut progress: Option<recovery_progress::Progress> = None;
+            let mut count = 0_usize;
+            let mut bundles_ms = 0_u64;
+            let mut upload_ms = 0_u64;
+            let mut gathered_bytes = 0_u64;
+            let mut tail = Some(std::mem::take(&mut gathered));
+            for (index, window) in windows.into_iter().enumerate() {
+                let fetch_started = mono_ms();
+                let fetches = window.into_iter().map(|key| {
+                    let bucket = self.bucket.clone();
+                    async move {
+                        let fetched = bucket
+                            .get(&key)
+                            .await
+                            .with_context(|| format!("read retained recovery bundle {key}"))?;
+                        let (bytes, _) = fetched
+                            .ok_or_else(|| anyhow!("listed recovery bundle {key} disappeared"))?;
+                        anyhow::Ok((key, bytes))
+                    }
+                });
+                let mut fetches = futures_util::stream::iter(fetches)
+                    .buffer_unordered(RECOVERY_UPLOAD_CONCURRENCY);
+                while let Some(fetched) = futures_util::StreamExt::next(&mut fetches).await {
+                    self.beat_claim(dead, &mut beat).await?;
+                    let (key, bytes) = fetched?;
+                    let rows = celld_ltx::bundle::decode_rows(&bytes)
+                        .with_context(|| format!("decode retained recovery bundle {key}"))?;
+                    for row in rows {
+                        let payload = celld_ltx::bundle::slice(&bytes, &row)
+                            .with_context(|| format!("read a row from recovery bundle {key}"))?;
+                        gathered
+                            .entry((row.cell, row.cell_epoch, row.txid))
+                            .or_insert_with(|| payload.to_vec());
+                    }
+                }
+                drop(fetches);
+                if index + 1 == window_count {
+                    // The same bytes under the same key wherever a row is
+                    // held; the follower's copy stays the one uploaded, as
+                    // it was when the whole session folded at once.
+                    for (key, bytes) in tail.take().into_iter().flatten() {
+                        gathered.insert(key, bytes);
+                    }
+                }
+                bundles_ms += mono_ms().saturating_sub(fetch_started);
+                let held: u64 = gathered.values().map(|bytes| bytes.len() as u64).sum();
+                #[cfg(all(test, celld_internal_tests))]
+                self.recovery_gather_peak_bytes
+                    .fetch_max(held, Ordering::SeqCst);
+                gathered_bytes += held;
+                // Skip rows the drain points already folded into the
+                // per-cell prefix: one listing per cell bounds uploads to
+                // the true un-drained tail, so recovery cost tracks the
+                // flush window, not the epoch's age. LTX TXIDs are
+                // contiguous per epoch, so coverage up to the listed
+                // maximum is coverage of everything at or below it. Cells
+                // drive concurrently — the sequential version cost the lab
+                // ~47 s for 180 entries — while rows within a cell stay
+                // ordered; any failure aborts the pass before the record
+                // can seal.
+                if gathered.is_empty() {
+                    continue;
+                }
+                let upload_started = mono_ms();
+                if progress.is_none() {
+                    progress =
+                        Some(recovery_progress::Progress::load(self, dead, &mut beat).await?);
+                }
+                let loaded = progress
+                    .as_mut()
+                    .expect("the progress record is loaded before the first upload");
+                count += self
+                    .upload_gathered(
+                        std::mem::take(&mut gathered),
+                        Some((dead, &mut beat, loaded)),
+                    )
+                    .await?;
+                upload_ms += mono_ms().saturating_sub(upload_started);
+            }
             // The record is re-read for the token the beats moved.
             let mut sealed = false;
             for _ in 0..3 {
@@ -4705,6 +4941,8 @@ impl NodeLogManager {
                     pass = _attempt,
                     members_ms,
                     bundles_read,
+                    windows = window_count,
+                    gathered_bytes,
                     bundles_ms,
                     upload_ms,
                     total_ms = mono_ms().saturating_sub(pass_started),
@@ -4815,7 +5053,7 @@ impl NodeLogManager {
             return;
         };
         let active = current.active;
-        // In bundle mode "tiered" includes bundle coverage, but a sealed
+        // "Tiered" includes bundle coverage, but a sealed
         // record tells every future recovery there is nothing to gather —
         // so the seal requires every acked row as a per-cell object. The
         // barrier is the RETAINED BUNDLE SCAN, not a cell counter: the
@@ -4826,11 +5064,10 @@ impl NodeLogManager {
         // An Open record is always safe: the next incarnation's recovery
         // drains the bundles.
         let per_cell_complete = self.ltx.all_tails_ready_for_graceful_seal()
-            && (!self.bundle_mode
-                || match self.uncovered_bundle_rows().await {
-                    Ok(uncovered) => uncovered.is_empty(),
-                    Err(_) => false,
-                });
+            && match self.uncovered_bundle_rows().await {
+                Ok(uncovered) => uncovered.is_empty(),
+                Err(_) => false,
+            };
         if !log_tier::graceful_seal_allowed(
             &record,
             shipper.epoch,
@@ -5186,10 +5423,9 @@ impl NodeLogManager {
         self.uncovered_bundle_rows_for(None).await
     }
 
-    /// The same scan bounded to one cell. The reactivation fold uses it:
-    /// the whole-session listing still runs (the in-memory index caps at
-    /// 512 bundles, below a churn-heavy tail), but watermark lookups and
-    /// payload GETs are paid only for the named cell's rows.
+    /// The same scan bounded to one cell. The reactivation fold uses the
+    /// complete process-session membership index, so it does not list the
+    /// bundle prefix or read a bundle that cannot contain the named cell.
     async fn uncovered_bundle_rows_for(
         &self,
         only_cell: Option<&str>,
@@ -5206,23 +5442,28 @@ impl NodeLogManager {
             Payload(bytes::Bytes),
             Indexed(Vec<celld_ltx::bundle::BundleRow>),
         }
-        let listed = self.bucket.list(&prefix).await?;
-        let fetches = listed.into_iter().map(|meta| {
-            let key = meta.location.as_ref().to_string();
-            let indexed = {
-                let index = self.bundle_index.lock().unwrap();
-                index
-                    .iter()
-                    .find(|(indexed, _)| *indexed == key)
-                    .map(|(_, rows)| rows.clone())
-            };
+        let candidates = match only_cell {
+            Some(cell) => self.bundle_index.lock().unwrap().bundles_for(cell),
+            None => self
+                .bucket
+                .list(&prefix)
+                .await?
+                .into_iter()
+                .map(|meta| {
+                    let key = meta.location.as_ref().to_string();
+                    let rows = self.bundle_index.lock().unwrap().rows(&key);
+                    (key, rows)
+                })
+                .collect(),
+        };
+        let fetches = candidates.into_iter().map(|(key, indexed)| {
             let bucket = self.bucket.clone();
             async move {
                 // The rows travel WITH the index hit. Looking them up again
-                // after the fetch let a rotation out of the bounded index
-                // drop the bundle from the scan between the two lookups,
-                // and a dropped bundle reads as a bundle with no rows --
-                // the same silent gap a failed read used to leave.
+                // after the fetch let a rotation out of the bounded row index
+                // drop the bundle from the scan between the two lookups, and a
+                // dropped bundle reads as a bundle with no rows -- the same
+                // silent gap a failed read used to leave.
                 if let Some(rows) = indexed {
                     return anyhow::Ok(Some((key, Fetched::Indexed(rows))));
                 }
@@ -5433,41 +5674,38 @@ impl NodeLogManager {
     }
 
     pub async fn gc_bundles(&self) -> anyhow::Result<()> {
-        // 512, not 32: the lab's profiling round found 1,300+ retained
-        // bundles — at ~1 bundle/s produced and 32 examined per 30 s tick
-        // the backlog only ever grew, and recovery's whole-prefix gather
-        // paid for it (89-112 s of a 97-116 s outage). The examined set
-        // costs one LIST plus mostly index-hits; the covered_txid cache
-        // bounds the per-tick LIST fan-out to the cell count. The TIME
-        // budget is the other half: un-indexed bundles cost a GET each,
-        // and an unbounded drain pass competed with serving hard enough
-        // to gray followers and trigger eviction churn (the ~300 ms
-        // bucket-riding window the faceted latency lanes exposed). The
-        // pass stops at the budget; the next tick continues where the
-        // listing puts it.
-        const EXAMINED_PER_TICK: usize = 512;
+        // Bound both the listing and the work. Restarting at the prefix
+        // every tick starved newer, covered bundles behind an undrained
+        // prefix forever. Advance after every examination, even a failed GET,
+        // and wrap only when the page reaches the end of the session.
         const TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+        let mut cursor = self.bundle_gc_cursor.lock().await;
         let started = mono_ms();
         let prefix = format!("log/{}/bundle/", self.session);
+        let page = self
+            .bucket
+            .list_page(
+                &prefix,
+                cursor.as_deref(),
+                BUNDLE_GC_EXAMINED_PER_TICK,
+                None,
+            )
+            .await?;
         let mut covered: HashMap<(String, u64), u64> = HashMap::new();
         let mut deletable: Vec<(String, usize)> = Vec::new();
-        for meta in self
-            .bucket
-            .list(&prefix)
-            .await?
-            .into_iter()
-            .take(EXAMINED_PER_TICK)
-        {
-            if mono_ms().saturating_sub(started) > TICK_BUDGET.as_millis() as u64 {
+        let mut exhausted = true;
+        for (examined, meta) in page.objects.into_iter().enumerate() {
+            // Always examine one object so a slow listing cannot prevent
+            // progress. The budget can stop the remainder of the page.
+            if examined > 0 && mono_ms().saturating_sub(started) > TICK_BUDGET.as_millis() as u64 {
+                exhausted = false;
                 break;
             }
-            let key = meta.location.as_ref().to_string();
+            let key = meta.key;
+            *cursor = Some(key.clone());
             let indexed = {
                 let index = self.bundle_index.lock().unwrap();
-                index
-                    .iter()
-                    .find(|(indexed, _)| *indexed == key)
-                    .map(|(_, rows)| rows.clone())
+                index.rows(&key)
             };
             let rows = match indexed {
                 Some(rows) => rows,
@@ -5493,11 +5731,19 @@ impl NodeLogManager {
                     }
                 };
                 paired.push((row.txid, watermark));
+                // One uncovered row retains the whole bundle. Do not pay
+                // for every other cell before reaching the same answer.
+                if !log_tier::bundle_deletable([(row.txid, watermark)]) {
+                    break;
+                }
             }
             if !log_tier::bundle_deletable(paired) {
                 continue;
             }
             deletable.push((key, rows.len()));
+        }
+        if exhausted && !page.truncated {
+            *cursor = None;
         }
         if deletable.is_empty() {
             return Ok(());
@@ -5512,10 +5758,7 @@ impl NodeLogManager {
                 .filter(|(key, _)| gone.contains(key))
                 .map(|(_, rows)| rows)
                 .sum();
-            self.bundle_index
-                .lock()
-                .unwrap()
-                .retain(|(indexed, _)| !gone.contains(indexed));
+            self.bundle_index.lock().unwrap().remove(&gone);
             info!(
                 bundles = gone.len(),
                 rows, "bundle GC: drained bundles deleted in one batch"
@@ -5786,103 +6029,92 @@ fn spawn_fragment_gc(
     });
 }
 
-impl crate::ltx_repl::BundleSink for NodeLogManager {
+impl NodeLogManager {
     /// One object per node-flush: `log/<node>/bundle/e<epoch>-<seq>.ltxb`,
     /// verbatim L0 segments plus the footer (`crate::bundle`). Keys are
     /// unique per (epoch, seq), so the PUT needs no condition; the epoch in
     /// the key scopes recovery's gather and the eventual GC sweep.
-    fn put_bundle<'a>(
-        &'a self,
-        entries: Vec<celld_ltx::bundle::BundleEntry>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
-        Box::pin(async move {
-            struct FlushGuard<'a>(&'a std::sync::atomic::AtomicBool);
-            impl Drop for FlushGuard<'_> {
-                fn drop(&mut self) {
-                    self.0.store(false, Ordering::SeqCst);
-                }
+    pub(crate) async fn put_bundle(&self, entries: Vec<celld_ltx::bundle::BundleEntry>) -> bool {
+        struct FlushGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for FlushGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
             }
-            self.flush_in_flight.store(true, Ordering::SeqCst);
-            let _flush = FlushGuard(&self.flush_in_flight);
-            let (epoch, flusher) = {
-                let inner = self.inner.lock().unwrap();
-                match inner.as_ref() {
-                    Some(shipper) => (shipper.epoch, shipper.clone()),
-                    None => return false,
-                }
-            };
-            let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
-            let body = match celld_ltx::bundle::encode(&entries) {
-                Ok(body) => body,
-                Err(error) => {
-                    warn!(%error, "bundle encode failed");
+        }
+        self.flush_in_flight.store(true, Ordering::SeqCst);
+        let _flush = FlushGuard(&self.flush_in_flight);
+        let (epoch, flusher) = {
+            let inner = self.inner.lock().unwrap();
+            match inner.as_ref() {
+                Some(shipper) => (shipper.epoch, shipper.clone()),
+                None => return false,
+            }
+        };
+        let seq = self.bundle_seq.fetch_add(1, Ordering::SeqCst);
+        let body = match celld_ltx::bundle::encode(&entries) {
+            Ok(body) => body,
+            Err(error) => {
+                warn!(%error, "bundle encode failed");
+                return false;
+            }
+        };
+        let rows = match celld_ltx::bundle::decode_rows(&body) {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "bundle self-decode failed");
+                return false;
+            }
+        };
+        let key = format!("log/{}/bundle/e{epoch}-{seq:08}.ltxb", self.session);
+        match self.bucket.put(&key, body).await {
+            Ok(()) => {
+                // The credit check: the PUT is unconditional, so by
+                // itself it proves nothing to the ack path — a healed
+                // zombie whose record a recoverer already sealed can
+                // still land bundle objects, and crediting them would
+                // ack rows no future takeover reads (the sealed record
+                // says the bucket is complete, and takeovers read
+                // per-cell prefixes). Durability credits only if the
+                // record is still Open at this shipper's epoch AFTER
+                // the PUT: any recovery that fences later must list
+                // after this PUT completed and therefore gathers it.
+                // A BUCKET read on purpose: the hazard is a peer's
+                // recovery CAS fencing this record, which the
+                // in-process copy cannot see.
+                let credit = log_tier::bundle_credit_allowed(
+                    read_record(&self.bucket, &self.session)
+                        .await
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        .map(|folded| &folded.record),
+                    epoch,
+                );
+                if !credit {
+                    // Degrade the shipper that OWNED this flush's
+                    // epoch, not whichever is installed now: a flush
+                    // racing a legitimate reconfiguration must not
+                    // poison the successor ensemble it knows nothing
+                    // about. For a true zombie the flusher IS the
+                    // installed shipper and stops exactly as before;
+                    // for a swap race this degrades a retired object,
+                    // which is the correct no-op — the lab measured
+                    // the alternative as an epoch-churn loop.
+                    flusher.degrade("record moved under a bundle flush");
+                    warn!(key, "bundle flush not credited: record moved");
                     return false;
                 }
-            };
-            let rows = match celld_ltx::bundle::decode_rows(&body) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    warn!(%error, "bundle self-decode failed");
-                    return false;
-                }
-            };
-            let key = format!("log/{}/bundle/e{epoch}-{seq:08}.ltxb", self.session);
-            match self.bucket.put(&key, body).await {
-                Ok(()) => {
-                    // The credit check: the PUT is unconditional, so by
-                    // itself it proves nothing to the ack path — a healed
-                    // zombie whose record a recoverer already sealed can
-                    // still land bundle objects, and crediting them would
-                    // ack rows no future takeover reads (the sealed record
-                    // says the bucket is complete, and takeovers read
-                    // per-cell prefixes). Durability credits only if the
-                    // record is still Open at this shipper's epoch AFTER
-                    // the PUT: any recovery that fences later must list
-                    // after this PUT completed and therefore gathers it.
-                    // A BUCKET read on purpose: the hazard is a peer's
-                    // recovery CAS fencing this record, which the
-                    // in-process copy cannot see.
-                    let credit = log_tier::bundle_credit_allowed(
-                        read_record(&self.bucket, &self.session)
-                            .await
-                            .ok()
-                            .flatten()
-                            .as_ref()
-                            .map(|folded| &folded.record),
-                        epoch,
-                    );
-                    if !credit {
-                        // Degrade the shipper that OWNED this flush's
-                        // epoch, not whichever is installed now: a flush
-                        // racing a legitimate reconfiguration must not
-                        // poison the successor ensemble it knows nothing
-                        // about. For a true zombie the flusher IS the
-                        // installed shipper and stops exactly as before;
-                        // for a swap race this degrades a retired object,
-                        // which is the correct no-op — the lab measured
-                        // the alternative as an epoch-churn loop.
-                        flusher.degrade("record moved under a bundle flush");
-                        warn!(key, "bundle flush not credited: record moved");
-                        return false;
-                    }
-                    let mut index = self.bundle_index.lock().unwrap();
-                    index.push_back((key, rows));
-                    // Bounded: older bundles are compacted past or folded
-                    // by drains; the cap only limits the overlay's view.
-                    while index.len() > 512 {
-                        index.pop_front();
-                    }
-                    true
-                }
-                Err(error) => {
-                    warn!(%error, key, "bundle put failed");
-                    false
-                }
+                self.bundle_index.lock().unwrap().insert(key, rows);
+                true
             }
-        })
+            Err(error) => {
+                warn!(%error, key, "bundle put failed");
+                false
+            }
+        }
     }
 
-    fn active(&self) -> bool {
+    pub(crate) fn bundle_active(&self) -> bool {
         // Draining rides the bundle path even while the shipper is
         // DEGRADED: degrade stops fleet proofs, not tiering. The credit
         // check against the record is the safety gate (a sealed or
@@ -5893,47 +6125,116 @@ impl crate::ltx_repl::BundleSink for NodeLogManager {
         // once the graceful close begins its seal scan, a new flush could
         // credit rows the scan never saw, so `closing` quiesces the sink
         // and late writes ride per-cell acks instead.
-        self.bundle_mode
-            && !self.closing.load(Ordering::SeqCst)
-            && self.inner.lock().unwrap().is_some()
+        !self.closing.load(Ordering::SeqCst) && self.inner.lock().unwrap().is_some()
     }
 
-    fn rows_for(&self, cell: &str, epoch: u64) -> Vec<celld_ltx::LocatedRow> {
-        let index = self.bundle_index.lock().unwrap();
-        index
-            .iter()
-            .flat_map(|(key, rows)| {
-                rows.iter()
-                    .filter(|row| row.cell == cell && row.cell_epoch == epoch)
-                    .map(|row| celld_ltx::LocatedRow {
-                        source: key.clone(),
-                        row: row.clone(),
-                    })
-            })
-            .collect()
+    /// One cell epoch's retained bundle rows, for the compaction overlay.
+    /// A slow cell can outlive the bounded row index, so a row that left the
+    /// index is read from the persisted bundles that the membership names.
+    pub(crate) async fn rows_for(
+        &self,
+        cell: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Vec<celld_ltx::LocatedRow>> {
+        let CellBundleRows {
+            mut located,
+            evicted,
+            evicted_through,
+        } = self.bundle_index.lock().unwrap().cell_rows(cell, epoch);
+        let covered = self.ltx.covered_txid(cell, epoch).await;
+        if evicted_through.is_some_and(|through| covered < through) {
+            // A cache is not the source of truth. A slow cell can lose its
+            // first row long before it reaches the compaction threshold.
+            // Fetch only the evicted bundles that contain the cell, with
+            // bounded concurrency. A failed read must fail the compaction;
+            // treating it as no rows would hide a gap or report false
+            // completion.
+            let fetches = evicted.into_iter().map(|key| async move {
+                let rows = match self.bucket.get(&key).await? {
+                    Some((bytes, _)) => celld_ltx::bundle::decode_rows(&bytes)?,
+                    // GC removes only rows covered by the per-cell layout.
+                    // A concurrent deletion is safe to omit.
+                    None => Vec::new(),
+                };
+                anyhow::Ok((key, rows))
+            });
+            let mut fetches =
+                futures_util::stream::iter(fetches).buffer_unordered(COVERAGE_READ_CONCURRENCY);
+            while let Some(fetched) = fetches.next().await {
+                let (key, rows) = fetched?;
+                located.extend(
+                    rows.into_iter()
+                        .filter(|row| row.cell == cell && row.cell_epoch == epoch)
+                        .map(|row| celld_ltx::LocatedRow {
+                            source: key.clone(),
+                            row,
+                        }),
+                );
+            }
+        }
+        // A folded L0 can cover several rows still in the index. The
+        // overlay deduplicates file starts, not interior transactions;
+        // returning those rows merges the same transaction twice.
+        located.retain(|located| located.row.txid > covered);
+        Ok(located)
     }
 
-    fn fetch_bundle<'a>(
-        &'a self,
-        source: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            {
-                let cache = self.bundle_cache.lock().await;
-                if let Some((key, bytes)) = cache.as_ref() {
-                    if key == source {
-                        return Ok(bytes.as_ref().clone());
-                    }
+    pub(crate) async fn fetch_bundle(&self, source: &str) -> anyhow::Result<Vec<u8>> {
+        {
+            let cache = self.bundle_cache.lock().await;
+            if let Some((key, bytes)) = cache.as_ref() {
+                if key == source {
+                    return Ok(bytes.as_ref().clone());
                 }
             }
-            let Some((bytes, _)) = self.bucket.get(source).await? else {
-                anyhow::bail!("bundle {source} vanished");
-            };
-            let bytes: Vec<u8> = bytes.to_vec();
-            *self.bundle_cache.lock().await = Some((source.to_string(), Arc::new(bytes.clone())));
-            Ok(bytes)
-        })
+        }
+        let Some((bytes, _)) = self.bucket.get(source).await? else {
+            anyhow::bail!("bundle {source} vanished");
+        };
+        let bytes: Vec<u8> = bytes.to_vec();
+        *self.bundle_cache.lock().await = Some((source.to_string(), Arc::new(bytes.clone())));
+        Ok(bytes)
+    }
+
+    /// Compaction can encounter a snapshot row larger than its input budget.
+    /// Read only that row's requested bytes, without cloning or caching its
+    /// complete bundle. The compactor validates the assembled LTX checksum.
+    pub(crate) async fn fetch_bundle_range(
+        &self,
+        located: &celld_ltx::LocatedRow,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        use crate::bucket::{BlobConditions, BlobRange, BlobRead};
+        let len = len.min(located.row.len.saturating_sub(offset));
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = located
+            .row
+            .offset
+            .checked_add(offset)
+            .ok_or_else(|| anyhow!("bundle row range overflows"))?;
+        let BlobRead::Hit(mut blob) = self
+            .bucket
+            .get_blob(
+                &located.source,
+                BlobRange::Bounded {
+                    offset,
+                    length: len,
+                },
+                &BlobConditions::default(),
+            )
+            .await?
+        else {
+            anyhow::bail!("bundle {} vanished", located.source);
+        };
+        let mut bytes = Vec::new();
+        while let Some(chunk) = blob.body.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|error| anyhow!(error))?);
+        }
+        anyhow::ensure!(bytes.len() as u64 == len, "bundle row range is short");
+        Ok(bytes)
     }
 
     /// Recovery's gather for one cell, run by the successor of a quiet
@@ -5949,51 +6250,46 @@ impl crate::ltx_repl::BundleSink for NodeLogManager {
     /// `upload_gathered` skips rows the per-cell watermark covers and
     /// merges the contiguous tail into one object, so a re-run after a
     /// partial failure repeats no upload.
-    fn fold_cell<'a>(
-        &'a self,
-        cell: &'a str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut gathered = self.uncovered_bundle_rows_for(Some(cell)).await?;
-            let record = read_record(&self.bucket, &self.session)
-                .await?
-                .map(|folded| folded.record);
-            if let Some(record) = record {
-                for member in &record.ensemble {
-                    let lease = self.ownership.read_node_lease(member).await?;
-                    let addr = lease
-                        .map(|lease| lease.addr)
-                        .ok_or_else(|| anyhow!("fold member {member} has no lease"))?;
-                    let tail = self
-                        .post_tail(
-                            member,
-                            &addr,
-                            &TailReq {
-                                leader: self.session.clone(),
-                            },
-                        )
-                        .await
-                        .map_err(|error| anyhow!("fold tail from {member}: {error}"))?;
-                    for entry in tail.entries {
-                        if entry.cell != cell {
-                            continue;
-                        }
-                        gathered
-                            .entry((entry.cell, entry.cell_epoch, entry.txid))
-                            .or_insert(entry.bytes);
+    pub(crate) async fn fold_cell(&self, cell: &str) -> anyhow::Result<()> {
+        let mut gathered = self.uncovered_bundle_rows_for(Some(cell)).await?;
+        let record = read_record(&self.bucket, &self.session)
+            .await?
+            .map(|folded| folded.record);
+        if let Some(record) = record {
+            for member in &record.ensemble {
+                let lease = self.ownership.read_node_lease(member).await?;
+                let addr = lease
+                    .map(|lease| lease.addr)
+                    .ok_or_else(|| anyhow!("fold member {member} has no lease"))?;
+                let tail = self
+                    .post_tail(
+                        member,
+                        &addr,
+                        &TailReq {
+                            leader: self.session.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(|error| anyhow!("fold tail from {member}: {error}"))?;
+                for entry in tail.entries {
+                    if entry.cell != cell {
+                        continue;
                     }
+                    gathered
+                        .entry((entry.cell, entry.cell_epoch, entry.txid))
+                        .or_insert(entry.bytes);
                 }
             }
-            if gathered.is_empty() {
-                return Ok(());
-            }
-            let uploaded = self.upload_gathered(gathered, None).await?;
-            info!(
-                cell,
-                uploaded, "folded a quietly stranded tail before reactivation"
-            );
-            Ok(())
-        })
+        }
+        if gathered.is_empty() {
+            return Ok(());
+        }
+        let uploaded = self.upload_gathered(gathered, None).await?;
+        info!(
+            cell,
+            uploaded, "folded a quietly stranded tail before reactivation"
+        );
+        Ok(())
     }
 }
 

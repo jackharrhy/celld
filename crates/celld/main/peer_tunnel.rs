@@ -679,7 +679,7 @@ impl TunnelUpgradeClaim {
 }
 
 /// Splice the upgraded client socket to the tunneled owner: the hop stops
-/// interpreting WebSocket frames and copies bytes until either side closes.
+/// dispatching WebSocket frames and copies bytes until either side closes.
 pub(crate) async fn splice<S>(client: S, parked: TunnelUpgradeClaim) -> anyhow::Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -694,23 +694,51 @@ where
             // The client went away; the owner sees EOF through the tunnel
             // and runs its own close dispatch.
         }
-        _ = tokio::io::copy(&mut inner_read, &mut client_write) => {
-            // The owner side ended. A clean close frame already crossed as
-            // bytes; an abnormal end left the client mid-conversation, so
-            // tell it the service restarted — the same 1012 the enveloped
-            // tunnel sent. After a clean close the client has already shut
-            // its state machine and ignores this frame.
-            let client = client_read.unsplit(client_write);
-            let mut ws = fastwebsockets::WebSocket::after_handshake(
-                client,
-                fastwebsockets::Role::Server,
-            );
-            let _ = ws
-                .write_frame(fastwebsockets::Frame::close(1012, b"owner unavailable"))
-                .await;
+        can_append_close = copy_owner_to_client(&mut inner_read, &mut client_write) => {
+            // A second Close fails browser channels. An incomplete frame
+            // would consume a synthetic Close as payload, so only append at
+            // a frame boundary before the owner starts closing.
+            if can_append_close {
+                let client = client_read.unsplit(client_write);
+                let mut ws = fastwebsockets::WebSocket::after_handshake(
+                    client,
+                    fastwebsockets::Role::Server,
+                );
+                let _ = ws
+                    .write_frame(fastwebsockets::Frame::close(1012, b"owner unavailable"))
+                    .await;
+            }
         }
     }
     Ok(())
+}
+
+/// Return whether owner EOF or a read error leaves room for a failure Close.
+/// A client write failure ends the splice without any further writes.
+async fn copy_owner_to_client<R, W>(owner: &mut R, client: &mut W) -> bool
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut scanner = celld_logic::schedule::WebSocketCloseScanner::default();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = match owner.read(&mut buffer).await {
+            Ok(0) | Err(_) => return scanner.can_append_close(),
+            Ok(read) => read,
+        };
+        if client.write_all(&buffer[..read]).await.is_err() {
+            return false;
+        }
+        scanner.observe(&buffer[..read]);
+        // Flush before waiting for more owner bytes, including a peer's
+        // closing-handshake response. Buffered writers must make progress.
+        if client.flush().await.is_err() {
+            return false;
+        }
+    }
 }
 
 type TunnelBody = http_body_util::combinators::UnsyncBoxBody<Bytes, std::io::Error>;

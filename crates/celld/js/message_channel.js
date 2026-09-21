@@ -36,7 +36,7 @@
       // refuses. Workerd serializes before it looks at the peer, so a
       // closed port still surfaces the DataCloneError; matching that
       // keeps postMessage's behavior independent of peer liveness.
-      const cf = globalThis.__cf;
+      const cf = __celld.__cf;
       if (cf && (value instanceof cf.RpcTarget ||
         value instanceof cf.ServiceStub)) {
         throw new DOMException(

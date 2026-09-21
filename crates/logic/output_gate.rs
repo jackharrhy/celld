@@ -23,7 +23,6 @@
 //! | --- | --- |
 //! | enumerate every output route | the [`Channel`] enum |
 //! | apply one rule to every route | the `channel` argument to [`State::output`] |
-//! | bypass the gate when disabled | with `CELLD_OUTPUT_GATE=0`, the shell sends no [`Event::OutputAt`] |
 //! | release only revealable state | the output's barrier, or the barrier it trails, has settled |
 //! | let the held effect leave | [`Effect::Release`] with `Ok` |
 //!
@@ -78,7 +77,6 @@ impl State {
     ///
     /// - `channel` names the route. This function stores it but does not branch
     ///   on it, so every channel uses one rule.
-    /// - with `CELLD_OUTPUT_GATE=0`, the shell never sends [`Event::OutputAt`].
     /// - no barrier means that no unproven write remains for this output to
     ///   reveal, so the core emits [`Effect::Release`] with `Ok`.
     ///
@@ -367,11 +365,11 @@ impl State {
             // position, so it settles rather than opening a second barrier.
             GateOwner::Alarm {
                 alarm,
-                at_ms,
+                snapshot,
                 covered,
             } => {
                 let outcome = if proven {
-                    Ok((at_ms, covered, None))
+                    Ok((snapshot, covered, None))
                 } else {
                     Err(Failure::Ambiguous)
                 };

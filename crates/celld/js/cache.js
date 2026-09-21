@@ -4,7 +4,7 @@
 // exactly that cache. Refusing the API would break the large class of
 // Workers that treat `caches.default` as a best-effort layer over their
 // own origin logic, so celld accepts the surface, validates it with
-// Workerd's rules and messages, and misses every match — the same
+// Workerd's rules and messages, and misses every match -- the same
 // posture as `passThroughOnException()`, which is a documented no-op
 // because there is no CDN behind it. A per-node in-memory cache can
 // replace the miss without changing any observable contract.
@@ -12,7 +12,7 @@
   const kCreate = Symbol("celld.Cache.create");
 
   // A key is a Request or URL string, and it must parse as an absolute
-  // http(s) URL — the same rule and message as Workerd's validateUrl.
+  // http(s) URL -- the same rule and message as Workerd's validateUrl.
   const asKey = (request) => {
     const url = request instanceof Request ? request.url : String(request);
     let parsed = null;

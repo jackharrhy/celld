@@ -458,8 +458,8 @@ impl WsRegistry {
 /// only within one instance. Each map a socket reaches must therefore belong
 /// to the same instance: a map that stayed process-wide would be shared by
 /// the sockets that two instances both numbered, and a second instance is not
-/// hypothetical — the private build runs one per test runtime, and a
-/// per-isolate or per-generation instance in production would inherit the
+/// hypothetical: a test can run multiple instances, and a per-isolate or
+/// per-generation instance in production would inherit the
 /// collision.
 pub(crate) struct WebSocketService {
     registry: Arc<std::sync::Mutex<WsRegistry>>,
@@ -1092,11 +1092,20 @@ pub(super) fn op_ws_upgrade(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
+    match &actor_runtime_state(scope).egress {
+        EgressPolicy::Allow => {}
+        EgressPolicy::Deny => {
+            return loader_throw(
+                scope,
+                "This worker is not permitted to access the internet via global functions.",
+            );
+        }
+        EgressPolicy::Broker(_) => {
+            return loader_throw(
+                scope,
+                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+            );
+        }
     }
     let id = args
         .get(0)
@@ -1204,11 +1213,20 @@ pub(super) fn op_ws_connect(
     args: v8::FunctionCallbackArguments,
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
-    if actor_runtime_state(scope).egress == EgressPolicy::Deny {
-        return loader_throw(
-            scope,
-            "This worker is not permitted to access the internet via global functions.",
-        );
+    match &actor_runtime_state(scope).egress {
+        EgressPolicy::Allow => {}
+        EgressPolicy::Deny => {
+            return loader_throw(
+                scope,
+                "This worker is not permitted to access the internet via global functions.",
+            );
+        }
+        EgressPolicy::Broker(_) => {
+            return loader_throw(
+                scope,
+                "A globalOutbound Fetcher cannot broker WebSockets in celld.",
+            );
+        }
     }
     let id = args
         .get(0)

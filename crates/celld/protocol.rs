@@ -37,6 +37,17 @@ pub struct Manifest {
     /// consumers drive the broker and have no environment binding.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queue_consumers: Vec<QueueConsumerConfig>,
+    /// The container classes of this deployment: class, image id, and the
+    /// instance shape. Each image tar is at `deploy/images/<id>.tar`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<crate::container::ContainerSpec>,
+    /// The `celld-fence` image `celld deploy` built beside the container
+    /// images: the node runs it once, privileged, to fence its container
+    /// bridges before any container starts. `None` in a deployment without
+    /// containers, and in one made by a celld that predates the fence,
+    /// which a node then refuses to start containers for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fence_image: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_features: Vec<String>,
     /// wrangler's raw metadata, retained verbatim for anything we don't yet model.
@@ -53,6 +64,7 @@ fn legacy_manifest_schema_version() -> u32 {
 /// partially and fail (or misbehave) at worker load instead.
 pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_ASSETS_V1,
+    FEATURE_CONTAINERS_V1,
     FEATURE_CRON_V1,
     FEATURE_D1_V1,
     FEATURE_KV_V1,
@@ -64,6 +76,10 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
+/// A deployment with `containers`. Required because a build without the
+/// container engine would load the manifest, build a `ctx` with no
+/// `container`, and fail only when the object first touches it.
+pub const FEATURE_CONTAINERS_V1: &str = "containers-v1";
 /// A deployment with D1 databases. Required because a build without the
 /// reserved `__D1Database` class would load the manifest and then fail every
 /// `env.DB` call at request time, on a node the developer is not watching —

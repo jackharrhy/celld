@@ -346,3 +346,62 @@ fn create_missing_parent_and_reject_future_schema_without_mutation() {
         999
     );
 }
+
+#[tokio::test]
+async fn timed_out_cas_waiting_for_sqlite_cannot_overwrite_a_newer_lease() {
+    use object_store::{PutMode, PutOptions, UpdateVersion};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("objects.sqlite3");
+    let stores = local(&database).unwrap();
+    let key = Path::from("nodes/lease");
+    let original = stores.objects.put(&key, "old".into()).await.unwrap();
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let options = PutOptions {
+        mode: PutMode::Update(UpdateVersion {
+            e_tag: original.e_tag,
+            version: original.version,
+        }),
+        ..Default::default()
+    };
+    let pending = stores
+        .objects
+        .put_opts(&key, "cancelled".into(), options.clone());
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut pending)
+            .await
+            .is_err()
+    );
+    // Model another owner winning before the cancelled blocking operation gets
+    // its writer lock. Cancellation cannot stop an in-flight SQLite operation.
+    writer
+        .execute(
+            "UPDATE objects SET etag=987654321 WHERE key='nodes/lease'",
+            [],
+        )
+        .unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    assert!(matches!(
+        stores.objects.put_opts(&key, "retry".into(), options).await,
+        Err(Error::Precondition { .. })
+    ));
+    assert!(matches!(pending.await, Err(Error::Precondition { .. })));
+    assert_eq!(
+        stores.objects.head(&key).await.unwrap().e_tag.as_deref(),
+        Some("987654321")
+    );
+    assert_eq!(
+        stores
+            .objects
+            .get(&key)
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+        "old"
+    );
+}

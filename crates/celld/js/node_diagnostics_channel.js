@@ -230,7 +230,7 @@
   const tracingChannel = (nameOrChannels) =>
     new TracingChannel(tracingToken, nameOrChannels);
 
-  globalThis.__diagnosticsChannelModule = {
+  __celld.__diagnosticsChannelModule = {
     Channel,
     TracingChannel,
     channel,

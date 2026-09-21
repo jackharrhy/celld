@@ -4,8 +4,5 @@
   "type": "module",
   "dependencies": {
     "agents": "https://pkg.pr.new/agents@2197"
-  },
-  "devDependencies": {
-    "esbuild": "0.28.1"
   }
 }

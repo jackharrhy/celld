@@ -6,9 +6,9 @@ fork release version and Rust toolchain. [Radio](https://github.com/jackharrhy/r
 and [Worldview](https://github.com/jackharrhy/worldview) use this mode.
 
 The fork retains the R2 full-read range repair found by Radio's live-runtime
-tests: full reads omit the optional range record. Upstream 0.5.1 supplies Azure
-metadata normalization; compatibility tests preserve reads of both `celld_r2`
-and `celld-r2` metadata from earlier fork releases.
+tests: full reads omit the optional range record. Upstream 0.6.2 retains Azure
+metadata normalization and reads both `celld_r2` and `celld-r2` metadata from
+earlier fork releases.
 
 ## Consume a release
 
@@ -82,6 +82,22 @@ local store can wait up to 30 seconds on a SQLite writer, longer than the defaul
 an unhealthy storage path. Qualify application upgrades with the constrained
 1 GiB upload, old-state migration, empty-replica crash recovery and lease-contention
 checks in addition to the public Rust suites.
+
+## Upgrade from 0.5.1 to 0.6.2
+
+Release `0.6.2-jh.1` follows upstream `90b43017241f81189453d326d05948f388b34652`.
+The production `sqlite://` backend, chunked local objects, offline copy tool,
+runtime secret overrides, reclaimable-cache admission policy, and the R2
+full-read range repair remain fork features. Upstream reorganized R2 metadata
+handling into a shared module; the repair now lives only at the get response.
+
+Upstream 0.6.0 gives facets their own replicated SQLite files and migrates
+the previous root-embedded facet images on first open. A fleet using fleet
+durability must stop every node before this upgrade; bucket durability can use
+a rolling update. The standalone SQLite deployment uses bucket durability,
+but still needs a stopped, complete backup of both object store and replica
+state before first use. Do not publish or deploy this fork release until its
+storage, migration, crash recovery, and application smokes pass.
 
 ## Runtime secrets
 

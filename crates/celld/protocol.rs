@@ -73,6 +73,7 @@ pub const SUPPORTED_DEPLOYMENT_FEATURES: &[&str] = &[
     FEATURE_R2_V1,
     FEATURE_WASM_V1,
     FEATURE_WORKFLOWS_V1,
+    FEATURE_PYTHON_WORKERS_V1,
 ];
 
 pub const FEATURE_ASSETS_V1: &str = "assets-v1";
@@ -96,6 +97,11 @@ pub const FEATURE_CRON_V1: &str = "cron-v1";
 pub const FEATURE_R2_V1: &str = "r2-v1";
 pub const FEATURE_SQLITE_VEC_V1: &str = "sqlite-vec-v1";
 pub const FEATURE_WASM_V1: &str = "wasm-v1";
+/// A deployment whose `main` is a `.py` file. Required because the bundle
+/// passes the Workers SDK's own body streams back to `Response`, and a node
+/// whose body streams do not report `ReadableStream` as their constructor
+/// fails those requests with a Python `TypeError`.
+pub const FEATURE_PYTHON_WORKERS_V1: &str = "python-workers-v1";
 /// A deployment with `workflows` bindings. Required because a build without
 /// the reserved workflow cell would load the manifest, build an `env` missing
 /// the binding, and fail only when the application first calls `create()` —

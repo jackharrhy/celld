@@ -77,15 +77,51 @@ const RESTORE_PLAN_CONCURRENCY: usize = SNAPSHOT_LEVEL as usize + 1;
 /// transient store or IO error is not one of these: a fenced single writer's
 /// position is still valid, and its re-upload is an idempotent overwrite. See
 /// [`Replica::sync`] for why celld narrows Litestream's clear-on-any-error.
+///
+/// The walk follows `source()` the way Go's `errors.Is` follows `%w`, and it
+/// also steps into a [`SyncStepError`], which hides its cause from `source()`.
+/// Matching only the outer variant made the reset unreachable: every sync
+/// error was already `Other`.
 fn pos_untrustworthy(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::NoSnapshots
-            | Error::ChecksumMismatch
-            | Error::LTXCorrupted
-            | Error::LTXMissing
-            | Error::TxNotAvailable
-    )
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(error) = cause {
+        if matches!(
+            error.downcast_ref::<Error>(),
+            Some(
+                Error::NoSnapshots
+                    | Error::ChecksumMismatch
+                    | Error::LTXCorrupted
+                    | Error::LTXMissing
+                    | Error::TxNotAvailable
+            )
+        ) {
+            return true;
+        }
+        cause = match error.downcast_ref::<SyncStepError>() {
+            Some(step) => Some(&step.cause),
+            None => error.source(),
+        };
+    }
+    false
+}
+
+/// A sync step's error, named for the step and keeping the original error so
+/// that [`pos_untrustworthy`] can classify it. Formatting the original into a
+/// string, as the port first did, discarded that variant.
+///
+/// The message already prints the cause, so `source()` does not return it.
+/// Returning it too makes a reporter that walks the chain print the cause a
+/// second time, after the step line.
+#[derive(Debug, thiserror::Error)]
+#[error("{step}: {cause}")]
+struct SyncStepError {
+    step: &'static str,
+    cause: Error,
+}
+
+/// Wraps an error from the named sync step, the Go `fmt.Errorf("step: %w")`.
+fn sync_step(step: &'static str) -> impl FnOnce(Error) -> Error {
+    move |cause| Error::Other(Box::new(SyncStepError { step, cause }))
 }
 
 /// Connects a database to a replication destination via a [`ReplicaClient`].
@@ -183,9 +219,10 @@ impl<C: ReplicaClient> Replica<C> {
 
     /// Copies new L0 LTX files from the local capture directory to the replica.
     ///
-    /// Ported from `Replica.Sync` (replica.go:132-180). On any error the cached
-    /// position is cleared so the next sync recomputes it from the replica
-    /// (replica.go:137-143). Requires an attached database.
+    /// Ported from `Replica.Sync` (replica.go:132-180). A divergence error clears
+    /// the cached position so the next sync recomputes it from the replica; a
+    /// transient error keeps it (see [`pos_untrustworthy`]). Requires an
+    /// attached database.
     pub async fn sync(&mut self) -> Result<()> {
         match self.sync_inner().await {
             Ok(()) => Ok(()),
@@ -216,10 +253,7 @@ impl<C: ReplicaClient> Replica<C> {
         // never runs on the hot path, and a fresh cell's pointless list of an
         // empty prefix is skipped entirely.
         if !self.pos_known {
-            let pos = self
-                .calc_pos()
-                .await
-                .map_err(|e| Error::Other(format!("calc pos: {e}").into()))?;
+            let pos = self.calc_pos().await.map_err(sync_step("calc pos"))?;
             self.set_pos(pos);
             self.pos_known = true;
         }
@@ -230,9 +264,8 @@ impl<C: ReplicaClient> Replica<C> {
                 .db
                 .as_mut()
                 .ok_or_else(|| Error::Other("no database attached to replica".into()))?;
-            db.pos().map_err(|e| {
-                Error::Other(format!("cannot determine current position: {e}").into())
-            })?
+            db.pos()
+                .map_err(sync_step("cannot determine current position"))?
         };
         if dpos.is_zero() {
             return Err(Error::Other("no position, waiting for data".into()));
@@ -278,7 +311,7 @@ impl<C: ReplicaClient> Replica<C> {
         self.client
             .write_ltx_file(level, min_txid, max_txid, &data)
             .await
-            .map_err(|e| Error::Other(format!("write ltx file: {e}").into()))?;
+            .map_err(sync_step("write ltx file"))?;
 
         Ok(())
     }
@@ -291,7 +324,7 @@ impl<C: ReplicaClient> Replica<C> {
         let info = self
             .max_ltx_file_info(0)
             .await
-            .map_err(|e| Error::Other(format!("max ltx file: {e}").into()))?;
+            .map_err(sync_step("max ltx file"))?;
         Ok(Pos::new(info.max_txid, info.post_apply_checksum))
     }
 
@@ -527,6 +560,17 @@ fn ensure_restore_output_absent(host: &crate::LtxHost, output_path: &Path) -> Re
     Ok(())
 }
 
+/// Maps a download failure during restore. A planned object that is gone
+/// becomes [`Error::LTXMissing`], so a caller that owns the listing can build
+/// a fresh plan: epoch GC can delete an object between plan selection and its
+/// download. Every other failure stays opaque and aborts the restore.
+fn classify_restore_open_error(e: Error) -> Error {
+    match &e {
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Error::LTXMissing,
+        _ => Error::Other(format!("open ltx file: {e}").into()),
+    }
+}
+
 async fn restore_from_plan_inner<C: ReplicaClient>(
     client: &C,
     output_path: &Path,
@@ -577,7 +621,7 @@ async fn restore_from_plan_inner<C: ReplicaClient>(
                 client
                     .open_ltx_file(info.level, info.min_txid, info.max_txid)
                     .await
-                    .map_err(|e| Error::Other(format!("open ltx file: {e}").into()))
+                    .map_err(classify_restore_open_error)
             }
         })
         .buffered(RESTORE_DOWNLOAD_CONCURRENCY)
@@ -1016,9 +1060,5 @@ pub mod internal {
 
     pub fn build_database_image(files: &[Vec<u8>]) -> Result<Vec<u8>> {
         super::build_database_image(files)
-    }
-
-    pub fn pos_untrustworthy(error: &Error) -> bool {
-        super::pos_untrustworthy(error)
     }
 }

@@ -7,6 +7,7 @@
 //! `celld-logic`.
 
 use crate::bucket::Bucket;
+use crate::host_services::HostMetricsSample;
 use anyhow::Context;
 use celld_logic::{
     CapacityPeer, CasGuard, CasOutcome, LeaseCasOutcome, NodeLeaseRecord, OwnerRecord,
@@ -15,7 +16,7 @@ use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Serialize)]
 struct OwnerWire<'a> {
@@ -219,8 +220,14 @@ pub(crate) struct NodeLogWire {
     pub(crate) epoch: u64,
     pub(crate) ensemble: Vec<String>,
     pub(crate) tiered: u64,
-    #[serde(default)]
-    pub(crate) active: bool,
+    /// False means this epoch has no fleet acknowledgements. True means it
+    /// can have them: the lease writer persists this marker before the first
+    /// fleet credit, and bucket coverage never clears it within that epoch.
+    /// The Rust field was originally named `active`. It was renamed to
+    /// `may_have_fleet_acks` to distinguish acknowledgement history from liveness.
+    /// The JSON key remains `active` for compatibility with existing records.
+    #[serde(default, rename = "active")]
+    pub(crate) may_have_fleet_acks: bool,
     /// The node recovering this log and its last heartbeat, while the state
     /// is `recovering`. Absent from records older than the claim.
     #[serde(default)]
@@ -396,11 +403,6 @@ pub struct BucketOwnership {
     /// the live Actor counters load-bearing.
     #[cfg(all(test, celld_internal_tests))]
     ambient_load_override: Option<AmbientLoadSample>,
-    /// A gated tooth observes whether a deterministic override reached the
-    /// production sampler. Such a call advances jemalloc's epoch and reads
-    /// process resources even if the caller later replaces the values.
-    #[cfg(all(test, celld_internal_tests))]
-    production_load_samples: AtomicUsize,
     /// The full folded log object this node's OWN lease record carries,
     /// tagged with a publish sequence.
     /// Renewals snapshot (seq, object) ONCE when they serialize the wire
@@ -446,6 +448,8 @@ pub fn node_is_shedding() -> bool {
 
 #[derive(Debug, Default)]
 pub struct LiveLoad {
+    /// Keep telemetry together: a torn RSS/in-use pair reads as allocator retention.
+    sample: Mutex<Option<HostMetricsSample>>,
     pub owned_cells: AtomicUsize,
     /// False until the actor has confirmed every record on its own disk
     /// after a start. The lease publishes no owned count until then, so a
@@ -456,7 +460,6 @@ pub struct LiveLoad {
     pub placement_weight: AtomicU64,
     pub resident_cells: AtomicUsize,
     pub host_websockets: AtomicUsize,
-    pub cpu_percent_x100: AtomicU64,
     pub pressured: AtomicBool,
     /// Stricter than not pressured: the last sample cleared every resume line.
     pub memory_headroom: AtomicBool,
@@ -472,6 +475,21 @@ pub struct LiveLoad {
     /// Set for the rest of the process once a drain begins, so a peer never
     /// hands a cell to a node that is giving its own away.
     pub draining: AtomicBool,
+}
+
+impl LiveLoad {
+    pub fn store_sample(&self, sample: HostMetricsSample) {
+        *self.sample.lock().unwrap() = Some(sample);
+    }
+
+    /// The stored sample, or `None` before the first one arrives.
+    pub(crate) fn stored_sample(&self) -> Option<HostMetricsSample> {
+        *self.sample.lock().unwrap()
+    }
+
+    pub(crate) fn sample(&self) -> HostMetricsSample {
+        self.sample.lock().unwrap().unwrap_or_default()
+    }
 }
 
 impl BucketOwnership {
@@ -493,8 +511,6 @@ impl BucketOwnership {
             fleet_sample_ms: 5_000,
             #[cfg(all(test, celld_internal_tests))]
             ambient_load_override: None,
-            #[cfg(all(test, celld_internal_tests))]
-            production_load_samples: AtomicUsize::new(0),
             own_log: std::sync::Mutex::new((0, None)),
             applied: tokio::sync::watch::channel((String::new(), 0)).0,
         }
@@ -521,11 +537,6 @@ impl BucketOwnership {
     #[cfg(all(test, celld_internal_tests))]
     pub(crate) fn load_sample_for_test(&self) -> NodeLoadWire {
         self.process_load()
-    }
-
-    #[cfg(all(test, celld_internal_tests))]
-    pub(crate) fn production_load_samples_for_test(&self) -> usize {
-        self.production_load_samples.load(Ordering::Relaxed)
     }
 
     pub fn lease_ttl_ms(&self) -> u64 {
@@ -1001,7 +1012,7 @@ impl BucketOwnership {
                 in_use_bytes: Some(ambient.in_use_bytes.max(1).min(rss_bytes)),
                 cgroup_working_set_bytes: ambient.cgroup_working_set_bytes,
                 cgroup_current_bytes: ambient.cgroup_current_bytes,
-                cpu_percent_x100: self.live.cpu_percent_x100.load(Ordering::Relaxed),
+                cpu_percent_x100: self.live.sample().cpu_percent_x100,
                 open_fds: ambient.open_fds,
                 fd_limit: ambient.fd_limit,
                 pressured: self.live.pressured.load(Ordering::Relaxed),
@@ -1013,8 +1024,6 @@ impl BucketOwnership {
                 container_instances: Default::default(),
             };
         }
-        #[cfg(all(test, celld_internal_tests))]
-        self.production_load_samples.fetch_add(1, Ordering::Relaxed);
         process_load(&self.live)
     }
 }
@@ -1189,65 +1198,37 @@ fn owned_cells(live: &LiveLoad) -> Option<usize> {
         .then(|| live.owned_cells.load(Ordering::Relaxed))
 }
 
-/// Sample the process with the schema a node lease publishes. `/state`
-/// reports the same sample, so an operator reads the numbers peers rank
-/// this node by rather than a second set assembled from other sources.
 fn placement_weight(live: &LiveLoad) -> Option<u64> {
     let weight = live.placement_weight.load(Ordering::Relaxed);
     (weight > 0).then_some(weight)
 }
 
-/// Sample the process with the schema a node lease publishes. `/state`
-/// reports the same sample, so an operator reads the numbers peers rank
-/// this node by rather than a second set assembled from other sources.
-#[allow(clippy::disallowed_methods)] // `/proc` is host telemetry, not node storage.
+/// Build the node load record from live counters and stored resource values.
+/// `/state` uses this record for `node_load`, and reports raw memory separately.
 pub(crate) fn process_load(live: &LiveLoad) -> NodeLoadWire {
-    // One sample for both numbers. Reading the resident set size here and the
-    // in-use figure from a value the actor wrote on its own timer would publish
-    // a pair from two instants, and before the first sample it would publish a
-    // real resident set size beside an in-use figure of zero -- which reads as
-    // total allocator retention.
-    let memory = crate::memory::sample();
-    // A 1-byte floor is the sentinel a platform without /proc leaves behind.
+    // One stored sample for both numbers. Resampling RSS here would pair two
+    // instants and report allocator retention that never occurred.
+    let sample = live.sample();
+    // A 1-byte floor is the sentinel before a sample or on a platform without /proc.
     // Both numbers take it, so the in-use figure can never read as zero beside
     // a real resident set size.
-    let rss_bytes = memory.rss_bytes.max(1);
-    let in_use_bytes = memory.in_use_bytes.max(1).min(rss_bytes);
-
-    #[cfg(target_os = "linux")]
-    let open_fds = std::fs::read_dir("/proc/self/fd")
-        .map(|entries| entries.count() as u64)
-        .unwrap_or_default();
-    #[cfg(not(target_os = "linux"))]
-    let open_fds = 0;
-
-    #[cfg(unix)]
-    let fd_limit = {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-            limit.rlim_cur
-        } else {
-            0
-        }
-    };
-    #[cfg(not(unix))]
-    let fd_limit = 0;
+    let rss_bytes = sample.rss_bytes.max(1);
+    let in_use_bytes = sample.in_use_bytes.max(1).min(rss_bytes);
 
     NodeLoadWire {
+        // Version the whole record, including live counters. Reusing the resource
+        // sample's time would retain peers' capacity reservations across renewals.
         sampled_ms: now_ms(),
         owned_cells: owned_cells(live),
         placement_weight: placement_weight(live),
         bucket_format: Some(celld_logic::format::BUCKET_FORMAT),
         rss_bytes,
         in_use_bytes: Some(in_use_bytes),
-        cgroup_working_set_bytes: memory.cgroup_working_set_bytes,
-        cgroup_current_bytes: memory.cgroup_current_bytes,
-        open_fds,
-        fd_limit,
-        cpu_percent_x100: live.cpu_percent_x100.load(Ordering::Relaxed),
+        cgroup_working_set_bytes: sample.cgroup_working_set_bytes,
+        cgroup_current_bytes: sample.cgroup_current_bytes,
+        open_fds: sample.open_fds,
+        fd_limit: sample.fd_limit,
+        cpu_percent_x100: sample.cpu_percent_x100,
         resident_cells: live.resident_cells.load(Ordering::Relaxed),
         host_websockets: live.host_websockets.load(Ordering::Relaxed),
         pressured: live.pressured.load(Ordering::Relaxed),

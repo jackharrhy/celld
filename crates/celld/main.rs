@@ -7,13 +7,18 @@
 //! Runnable celld vertical slice.
 //!
 //! One actor serializes every event through `celld-logic`; the actor polls its
-//! mailbox, timers, and in-flight effect futures together. This is the
-//! execution shape required for monotonic lease ticks to fence the node even
-//! when a storage operation remains hung, without spawning a task per effect.
+//! mailbox, timers, lease futures, and task completions together. Other effect
+//! work runs on the host runtime so synchronous work cannot starve the core's
+//! monotonic lease timers.
 
 use anyhow::Context as _;
 use celld::actor::*;
 use celld::bucket::Bucket;
+use celld::cell_dispatch::{
+    dispatch_call_attempt, dispatch_gate, local_dispatch_request_id, local_request_error,
+    local_response_stream, requests_websocket_upgrade, split_do_call, CallAttempt, CallPayload,
+    RoutedRequestError, WEBSOCKET_WITHOUT_UPGRADE,
+};
 use celld::fleet;
 use celld::generation::{
     DeploymentGraph, Generation, GenerationOptions, ReloadOutcome, ReloadRequest, FIRST_GENERATION,
@@ -243,6 +248,24 @@ type HttpReply = Response<UnsyncBoxBody<Bytes, std::io::Error>>;
 
 const STALE_ROUTE_HEADER: &str = "x-cells-route-error";
 const STALE_ROUTE_VALUE: &str = "stale-owner";
+/// Marks a forwarded fetch whose handler failed on the owner, so the caller's
+/// `stub.fetch()` rejects as it does for a local owner. Without the marker a
+/// remote handler failure looks like an application 500 response.
+const HANDLER_FAILURE_HEADER: &str = "x-cells-handler-failure";
+const HANDLER_FAILURE_PREFIX: &str = "cell Worker failed: ";
+
+/// A handler failure that the owner reported for a forwarded fetch. The owner
+/// ran the handler, so a retry would run it a second time.
+#[derive(Debug)]
+struct RemoteHandlerFailure(String);
+
+impl std::fmt::Display for RemoteHandlerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteHandlerFailure {}
 const DURABLE_OBJECT_ROUTING_ERROR_MARKER: &str = "__CELLD_DO_ROUTING_ERROR__:";
 
 fn owner_unreachable(scope: &str, owner: &str, source: anyhow::Error) -> anyhow::Error {
@@ -364,23 +387,6 @@ impl std::fmt::Display for StalePeerRoute {
 
 impl std::error::Error for StalePeerRoute {}
 
-#[derive(Debug)]
-struct RoutedRequestError(RequestError);
-
-/// The gate's verdict as the answer's error, with the handler's own failure
-/// kept below it when the answer was one: the client needs the verdict, and
-/// the operator reading the chain needs what the handler said too. The
-/// verdict stays on top, so the routed-error match still finds it.
-fn local_request_error(failure: LocalRequestFailure) -> anyhow::Error {
-    match failure {
-        LocalRequestFailure::Handler(error) => error,
-        LocalRequestFailure::OutputGate { verdict, handler } => match handler {
-            Some(handler) => handler.context(RoutedRequestError(verdict)),
-            None => anyhow::Error::new(RoutedRequestError(verdict)),
-        },
-    }
-}
-
 /// Preserve the owner's durability verdict and handler failure in a peer reply.
 fn peer_gate_failure(verdict: RequestError, handler: Option<&anyhow::Error>) -> HttpReply {
     let detail = match handler {
@@ -392,14 +398,6 @@ fn peer_gate_failure(verdict: RequestError, handler: Option<&anyhow::Error>) -> 
         format!("durability unproven: {verdict:?}{detail}"),
     ))
 }
-
-impl std::fmt::Display for RoutedRequestError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "route failed: {:?}", self.0)
-    }
-}
-
-impl std::error::Error for RoutedRequestError {}
 
 fn classify_remote_attempt(error: &anyhow::Error) -> celld_logic::routing::Attempt {
     if error.downcast_ref::<StalePeerRoute>().is_some()
@@ -602,32 +600,37 @@ impl WebSocketRouteTiming {
     }
 }
 
-/// The output gate for an effect raised inside a handler, as opposed to the
-/// handler's own response.
-///
-/// Every in-handler channel arrives here holding a `GateReq`. Reuses the routed
-/// machinery: `request` pins the cell (no eviction mid-wait) and the core gate
-/// decides. `Ok` releases the held effect; `Err` breaks the call, as a routed
-/// gate failure would.
-async fn dispatch_gate(app: AppHandle, req: celld::js::GateReq) {
-    let routed = match app.request(req.scope.clone()).await {
-        Ok(routed) => routed,
-        Err(error) => {
-            let _ = req.reply.send(Err(error));
-            return;
+/// A facet stream request from the isolate that runs the facet.
+async fn dispatch_facet(app: AppHandle, req: celld::js::FacetReq) {
+    use celld::js::FacetReq;
+    let Some(runtime) = app.runtime.as_ref() else {
+        let error = || anyhow::anyhow!("no cell runtime");
+        match req {
+            FacetReq::Open { reply, .. } => drop(reply.send(Err(error()))),
+            FacetReq::Delete { reply, .. } => drop(reply.send(Err(error()))),
+            FacetReq::Prove { reply, .. } => drop(reply.send(Err(error()))),
         }
+        return;
     };
-    // The guard pins the cell and releases the request on drop, so the else
-    // branch does not leak the just-acquired request.
-    let _activity = app.activity(routed.request, req.scope.clone());
-    let result = if routed.route == Route::Local {
-        app.gate_output(routed.request, req.ticket).await
-    } else {
-        // The owning isolate should route the cell locally; if it moved off the
-        // node mid-call, fail closed rather than acknowledge an unproven write.
-        Err(RequestError::NodeFenced)
-    };
-    let _ = req.reply.send(result);
+    match req {
+        FacetReq::Open {
+            root,
+            epoch,
+            names,
+            reply,
+        } => drop(reply.send(runtime.open_facet(&root, epoch, &names).await)),
+        FacetReq::Delete {
+            root,
+            epoch,
+            names,
+            reply,
+        } => drop(reply.send(runtime.delete_facet(&root, epoch, &names).await)),
+        FacetReq::Prove {
+            stream,
+            epoch,
+            reply,
+        } => drop(reply.send(runtime.prove_facet(&stream, epoch).await)),
+    }
 }
 
 /// Propagates a forwarding-side cancellation over the authenticated peer
@@ -1051,183 +1054,106 @@ async fn internal_reload(app: AppHandle) -> HttpReply {
     response(status, body.to_string())
 }
 
-fn local_dispatch_request_id(
-    request_id: Option<celld::js::RequestId>,
-) -> Option<celld::js::RequestId> {
-    // Internal Queue, cron, alarm, and peer calls have no client request ID,
-    // but a local handler still needs an identity in the abort registry. The
-    // drain cancels by core request and resolves that identity through the
-    // activity pin; leaving it absent makes a busy internal handler impossible
-    // to stop before the process deadline.
-    Some(request_id.unwrap_or_else(celld::js::next_request_id))
-}
-
 async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
-    let DoCallReq {
-        request_id,
-        cancel,
-        deliver_abort_to_handler,
-        scope,
-        name,
-        url,
-        method,
-        body,
-        mut body_guard,
-        headers,
-        reply,
-        order,
-        parent,
-    } = call;
-    let mut cancel = cancel;
-    let mut order = order;
-    let mut websocket_timing = headers
-        .iter()
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case("websocket")
-        })
-        .then(|| WebSocketRouteTiming {
+    let (mut call, mut payload, reply) = split_do_call(call);
+    let mut websocket_timing =
+        requests_websocket_upgrade(&payload.headers).then(|| WebSocketRouteTiming {
             started: Instant::now(),
             route_resolution_us: 0,
             dispatch_us: 0,
             attempts: 0,
         });
     let operation = async {
-        // Reclaims a streamed body abandoned by an early error below. A local
-        // target or the peer HTTP body takes ownership before this guard is
-        // disarmed.
-        anyhow::ensure!(
-            celld_logic::cell::valid_cell_scope(&scope),
-            "cell scope is malformed or exceeds the fleet storage limit"
-        );
         let mut dispatcher = RemoteRouteRetry::new(app.operation_deadline_ms);
         loop {
             if let Some(timing) = websocket_timing.as_mut() {
                 timing.attempts = timing.attempts.saturating_add(1);
             }
             let route_started = Instant::now();
-            // A disconnect before routing completes has executed no handler,
-            // so cancel the core request and release its activation admission.
-            // Once routing completes, the same signal moves into the local or
-            // remote dispatch below and aborts work that did start.
-            let route = app.request(scope.clone());
-            let routed = if deliver_abort_to_handler {
-                // Workerd delivers an explicit JavaScript AbortSignal to the
-                // target request. Resolve the route first, then give the
-                // already-fired receiver to fetch_cell so the handler sees
-                // request.signal and its waitUntil work can continue.
-                route.await
-            } else {
-                match cancel.as_mut() {
-                    Some(cancel) => celld::asyncrt::select_biased! {
-                        "a cancellation that ties route resolution prevents dispatch from starting";
-                        _ = cancel => break Err(anyhow::anyhow!("Durable Object call cancelled")),
-                        routed = route => routed,
-                    },
-                    None => route.await,
+            // The routed hook stamps the boundary between route resolution and
+            // local dispatch; the library owns that moment and cannot read the
+            // clock. A remote route leaves the stamp unused, because remote
+            // dispatch time starts after the stale-route pacing below.
+            let mut dispatch_started = route_started;
+            let attempt = dispatch_call_attempt(&app, &mut call, payload, || {
+                if let Some(timing) = websocket_timing.as_mut() {
+                    timing.route_resolution_us = timing
+                        .route_resolution_us
+                        .saturating_add(route_started.elapsed().as_micros() as u64);
                 }
-            };
-            let routed = match routed {
-                Ok(routed) => routed,
-                Err(error) => {
+                dispatch_started = Instant::now();
+            })
+            .await;
+            let (node, addr, epoch, peer_protocol) = match attempt {
+                CallAttempt::Unstarted(error) => break Err(error),
+                CallAttempt::RouteError(error) => {
                     if let Some(timing) = websocket_timing.as_mut() {
                         timing.route_resolution_us = timing
                             .route_resolution_us
                             .saturating_add(route_started.elapsed().as_micros() as u64);
-                        timing.emit(&app, &scope, request_id, "route_error", "", "");
+                        timing.emit(&app, &call.scope, call.request_id, "route_error", "", "");
                     }
-                    break Err(anyhow::Error::new(RoutedRequestError(error)));
+                    break Err(error);
                 }
-            };
-            if let Some(timing) = websocket_timing.as_mut() {
-                timing.route_resolution_us = timing
-                    .route_resolution_us
-                    .saturating_add(route_started.elapsed().as_micros() as u64);
-            }
-            let Routed { request, route } = routed;
-            let (node, addr, epoch, peer_protocol) = match route {
-                Route::Local => {
-                    let dispatch_started = Instant::now();
-                    let local_request_id = local_dispatch_request_id(request_id);
-                    let local =
-                        app.local_request(request, scope.clone(), local_request_id, "local");
-                    let completed = local
-                        .run(async {
-                            let runtime = app.runtime.as_ref().context("no cell runtime")?;
-                            let response = runtime
-                                .fetch_cell(
-                                    scope.clone(),
-                                    name,
-                                    RuntimeFetch {
-                                        url,
-                                        method,
-                                        body,
-                                        headers,
-                                        request_id: local_request_id,
-                                        // Moved on the first attempt and gone on
-                                        // a retry, which is right: a retry is a
-                                        // second delivery of a call whose place
-                                        // in the order was already taken.
-                                        order: order.take(),
-                                        parent,
-                                    },
-                                    cancel.take(),
-                                )
-                                .await?;
-                            // `fetch_cell` cannot return a response until the cell
-                            // has installed its request context. That context now
-                            // owns an unread tail through its waitUntil work.
-                            body_guard.disarm();
-                            if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
-                                let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false)
-                                {
-                                    WebSocketKind::Hibernatable
-                                } else {
-                                    WebSocketKind::Regular
-                                };
-                                app.websocket_opened(target.scope.clone(), target.id, kind)
-                                    .await?;
-                            }
-                            Ok(response)
-                        })
-                        .await;
-                    let activity = completed.activity;
-                    let result = completed.result.map_err(local_request_error);
-                    let result = match result {
-                        Ok(mut response) => {
-                            let body_active = response.stream.is_some();
-                            activity.set_phase("response_body", true, body_active);
-                            if let Some(stream) = response.stream.take() {
-                                response.stream =
-                                    Some(local_response_stream(stream, activity, || {}));
-                            } else {
-                                drop(activity);
-                            }
-                            Ok(response)
-                        }
-                        Err(error) => Err(error),
-                    };
+                CallAttempt::Local(result) => {
                     if let Some(timing) = websocket_timing.as_mut() {
                         timing.dispatch_us = timing
                             .dispatch_us
                             .saturating_add(dispatch_started.elapsed().as_micros() as u64);
                         timing.emit(
                             &app,
-                            &scope,
-                            request_id,
+                            &call.scope,
+                            call.request_id,
                             if result.is_ok() { "ok" } else { "error" },
                             "local",
-                            app.runtime.as_ref().map_or("", RuntimeManager::node),
+                            app.runtime.as_ref().map_or("", |runtime| runtime.node()),
                         );
                     }
                     break result;
                 }
-                Route::Remote {
+                CallAttempt::RefusedWebSocket { error, websocket } => {
+                    websocket::reject_accepted_websocket(&app, &websocket, &error.to_string())
+                        .await;
+                    if let Some(timing) = websocket_timing.as_mut() {
+                        timing.dispatch_us = timing
+                            .dispatch_us
+                            .saturating_add(dispatch_started.elapsed().as_micros() as u64);
+                        timing.emit(
+                            &app,
+                            &call.scope,
+                            call.request_id,
+                            "error",
+                            "local",
+                            app.runtime.as_ref().map_or("", |runtime| runtime.node()),
+                        );
+                    }
+                    break Err(error);
+                }
+                CallAttempt::Remote {
                     node,
                     addr,
                     epoch,
                     peer_protocol,
-                } => (node, addr, epoch, peer_protocol),
+                    payload: returned,
+                } => {
+                    // The attempt hands the payload back with the route, so a
+                    // retry re-enters routing with the body it never lost.
+                    payload = returned;
+                    (node, addr, epoch, peer_protocol)
+                }
             };
+            let scope = &call.scope;
+            let request_id = call.request_id;
+            let deliver_abort_to_handler = call.deliver_abort_to_handler;
+            let cancel = &mut call.cancel;
+            let body_guard = &mut call.body_guard;
+            let CallPayload {
+                name,
+                url,
+                method,
+                body,
+                headers,
+            } = &payload;
             if dispatcher.observe(&node, epoch) {
                 let cancel = if deliver_abort_to_handler {
                     None
@@ -1236,7 +1162,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                 };
                 match dispatcher.wait(cancel).await {
                     RemoteRetryOutcome::Ready => {
-                        dispatcher.invalidate(&app, &scope).await;
+                        dispatcher.invalidate(&app, scope).await;
                         continue;
                     }
                     RemoteRetryOutcome::Cancelled => {
@@ -1263,7 +1189,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         request_id,
                         capacity_handoff: epoch == 0,
                     };
-                    let attempt_body = match &body {
+                    let attempt_body = match body {
                         celld::js::RequestBody::Bytes(bytes) => {
                             celld::js::RequestBody::Bytes(bytes.clone())
                         }
@@ -1292,7 +1218,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         attempt_body,
                     )
                     .await
-                    .map_err(|error| owner_unreachable(&scope, &addr, error))?;
+                    .map_err(|error| owner_unreachable(scope, &addr, error))?;
                     // Only after the tunnel has taken the stream: `disarm`
                     // releases the guard's registry claim, and a claim that
                     // drops to zero deletes the entry, so disarming before
@@ -1307,7 +1233,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                     {
                         abort.disarm();
                         return Err(owner_unreachable(
-                            &scope,
+                            scope,
                             &addr,
                             anyhow::Error::new(StalePeerRoute {
                                 scope: scope.clone(),
@@ -1355,6 +1281,22 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                             observed_position: None,
                         });
                     }
+                    if response.headers().contains_key(HANDLER_FAILURE_HEADER) {
+                        // The owner ran the handler, so the attempt is
+                        // complete: the owner needs no abort, and the error
+                        // must not reach the redispatch policy below.
+                        abort.disarm();
+                        let body = Limited::new(response.into_body(), MAX_PEER_CONTROL_BODY_BYTES)
+                            .collect()
+                            .await
+                            .map(|body| body.to_bytes())
+                            .unwrap_or_default();
+                        let body = String::from_utf8_lossy(&body);
+                        let message = body.strip_prefix(HANDLER_FAILURE_PREFIX).unwrap_or(&body);
+                        return Err(anyhow::Error::new(RemoteHandlerFailure(
+                            message.to_string(),
+                        )));
+                    }
                     let response_headers = response
                         .headers()
                         .iter()
@@ -1398,9 +1340,15 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             match remote {
                 Ok(response) => {
                     if let Some(timing) = websocket_timing.as_ref() {
-                        timing.emit(&app, &scope, request_id, "ok", "remote", &node);
+                        timing.emit(&app, scope, request_id, "ok", "remote", &node);
                     }
                     break Ok(response);
+                }
+                Err(error) if error.downcast_ref::<RemoteHandlerFailure>().is_some() => {
+                    if let Some(timing) = websocket_timing.as_ref() {
+                        timing.emit(&app, scope, request_id, "error", "remote", &node);
+                    }
+                    break Err(error);
                 }
                 Err(error) => {
                     // A streamed upload is not replayable after the HTTP
@@ -1435,7 +1383,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         cancel.as_mut()
                     };
                     match dispatcher
-                        .retry(&app, &scope, classify_remote_attempt(&error), cancel, None)
+                        .retry(&app, scope, classify_remote_attempt(&error), cancel, None)
                         .await
                     {
                         RemoteRetryOutcome::Ready => continue,
@@ -1445,7 +1393,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         RemoteRetryOutcome::Stop => {}
                     }
                     if let Some(timing) = websocket_timing.as_ref() {
-                        timing.emit(&app, &scope, request_id, "error", "remote", &node);
+                        timing.emit(&app, scope, request_id, "error", "remote", &node);
                     }
                     break Err(error);
                 }
@@ -1594,11 +1542,11 @@ async fn request_payload(
     request: Request<Incoming>,
     trust_forwarded_headers: bool,
     max_body_bytes: usize,
-) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), HttpReply> {
+) -> Result<(String, String, Vec<u8>, Vec<(String, String)>), Box<HttpReply>> {
     let (parts, body) = request.into_parts();
     let body = collect_limited_body(body, max_body_bytes)
         .await
-        .map_err(|error| body_read_error("request", error))?;
+        .map_err(|error| Box::new(body_read_error("request", error)))?;
     let headers = parts
         .headers
         .iter()
@@ -1723,10 +1671,15 @@ fn internal_do_worker_error(error: anyhow::Error) -> HttpReply {
     if cell_overload_error(&error) {
         return cell_overload_response();
     }
-    response(
+    let mut failed = response(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("cell Worker failed: {error:#}"),
-    )
+        format!("{HANDLER_FAILURE_PREFIX}{error:#}"),
+    );
+    failed.headers_mut().insert(
+        hyper::header::HeaderName::from_static(HANDLER_FAILURE_HEADER),
+        hyper::header::HeaderValue::from_static("1"),
+    );
+    failed
 }
 
 /// Divide an ingress request into its metadata and a body that the Worker
@@ -1743,7 +1696,7 @@ async fn ingress_payload(
         celld::js::RequestBody,
         Vec<(String, String)>,
     ),
-    HttpReply,
+    Box<HttpReply>,
 > {
     let declared = request
         .headers()
@@ -1751,18 +1704,18 @@ async fn ingress_payload(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
     if declared.is_some_and(|length| length > max_body_bytes as u64) {
-        return Err(response(
+        return Err(Box::new(response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "request body too large",
-        ));
+        )));
     }
     let (url, method, body, headers, held) =
         ingress_payload_parts(request, trust_forwarded_headers, max_body_bytes).map_err(
             |error| {
-                response(
+                Box::new(response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!("request body stream: {error}"),
-                )
+                ))
             },
         )?;
     // The host collects a small body here. A read failure at this point
@@ -1773,7 +1726,7 @@ async fn ingress_payload(
         None => body,
         Some(held) => match collect_limited_body(held, max_body_bytes).await {
             Ok(collected) => celld::js::RequestBody::Bytes(collected),
-            Err(error) => return Err(body_read_error("request", error)),
+            Err(error) => return Err(Box::new(body_read_error("request", error))),
         },
     };
     Ok((url, method, body, headers))
@@ -1965,6 +1918,7 @@ fn request_url(parts: &hyper::http::request::Parts, trust_forwarded_headers: boo
 /// rather than only the node it connected to. `/do/` and `/runtime/` share this:
 /// they differ in what they authenticate, not in how they reach a cell.
 async fn dispatch_cell_fetch(
+    app: &AppHandle,
     cell: String,
     name: Option<String>,
     url: String,
@@ -2005,7 +1959,7 @@ async fn dispatch_cell_fetch(
     let _hangup = HangUp(Some(cancel_tx));
     match receive.await {
         Ok(Ok(worker_response)) => {
-            runtime_response(worker_response, preserve_representation_length)
+            reply_without_upgrade(app, worker_response, preserve_representation_length).await
         }
         Ok(Err(error)) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
@@ -2096,6 +2050,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                 drain_pins: app.drain_pins.clone(),
                 handler_active: true,
             };
+            let upgrade = requests_websocket_upgrade(&headers);
+            let mut accepted = None;
             let completed = local
                 .run(async {
                     let result = runtime
@@ -2120,10 +2076,28 @@ pub(crate) async fn dispatch_forwarded_fetch(
                     // gate wait below cancels the request's remaining work, not a
                     // handler that is still running.
                     abort.handler_answered();
-                    result
+                    let response = result?;
+                    if let Some(HttpResponseWebSocket::Cell(target)) = &response.websocket {
+                        accepted = Some(target.clone());
+                        // The same object-level check as a local call, so a
+                        // caller sees one answer whichever node owns the cell.
+                        anyhow::ensure!(upgrade, "TypeError: {WEBSOCKET_WITHOUT_UPGRADE}");
+                    }
+                    Ok(response)
                 })
                 .await;
             let activity = completed.activity;
+            // A failure after the cell returned a socket discards the response,
+            // which is the socket's only owner.
+            if let (Err(failure), Some(target)) = (&completed.result, accepted.as_ref()) {
+                let reason = match failure {
+                    LocalRequestFailure::Handler(error) => error.to_string(),
+                    LocalRequestFailure::OutputGate { verdict, .. } => {
+                        RoutedRequestError(*verdict).to_string()
+                    }
+                };
+                websocket::reject_accepted_websocket(&app, target, &reason).await;
+            }
             let result = match completed.result {
                 Ok(answer) => Ok(answer),
                 Err(LocalRequestFailure::Handler(error)) => Err(error),
@@ -2137,18 +2111,18 @@ pub(crate) async fn dispatch_forwarded_fetch(
             match result {
                 Ok(mut worker_response) => {
                     if let Some(HttpResponseWebSocket::Cell(target)) = &worker_response.websocket {
-                        let kind = if celld::js::ws_hibernatable(target.id).unwrap_or(false) {
+                        let (cell, hibernatable) = celld::js::ws_core_registration(target);
+                        let kind = if hibernatable {
                             WebSocketKind::Hibernatable
                         } else {
                             WebSocketKind::Regular
                         };
-                        if let Err(error) = app
-                            .websocket_opened(target.scope.clone(), target.id, kind)
-                            .await
-                        {
+                        if let Err(error) = app.websocket_opened(cell, target.id, kind).await {
+                            let reason = format!("WebSocket core registration failed: {error:#}");
+                            websocket::reject_accepted_websocket(&app, target, &reason).await;
                             return ForwardedFetchOutcome::Reply(peer_response(response(
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                format!("WebSocket core registration failed: {error:#}"),
+                                reason,
                             )));
                         }
                     }
@@ -2173,7 +2147,8 @@ pub(crate) async fn dispatch_forwarded_fetch(
                         abort.disarm();
                         drop(activity);
                     }
-                    runtime_response(worker_response, preserve_representation_length)
+                    reply_without_upgrade(&app, worker_response, preserve_representation_length)
+                        .await
                 }
                 Err(error) => internal_do_worker_error(error),
             }
@@ -2348,7 +2323,7 @@ pub(crate) async fn dispatch_forwarded_rpc(
 mod peer_tunnel;
 #[path = "main/websocket.rs"]
 mod websocket;
-use websocket::{handle_websocket, outbound_websocket_task};
+use websocket::{handle_websocket, outbound_websocket_task, reply_without_upgrade};
 
 async fn handle_ingress(
     request: Request<Incoming>,
@@ -2359,7 +2334,7 @@ async fn handle_ingress(
         // One snapshot for the asset decision and the Worker it may fall
         // into, so a deployment adopted mid-request cannot serve the new
         // generation's index with the old generation's Worker.
-        let generation = app.runtime.as_ref().map(RuntimeManager::generation);
+        let generation = app.runtime.as_ref().map(|runtime| runtime.generation());
         if let Some(resolver) = generation.as_deref().and_then(Generation::ingress_assets) {
             let path = request.uri().path();
             if !resolver.should_run_worker_first(path) {
@@ -2393,14 +2368,16 @@ async fn handle_ingress(
     .await
     {
         Ok(payload) => payload,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let preserve_representation_length = method.eq_ignore_ascii_case("HEAD");
     match app
         .fetch_worker(url, method, body, headers, connection)
         .await
     {
-        Ok(worker_response) => runtime_response(worker_response, preserve_representation_length),
+        Ok(worker_response) => {
+            reply_without_upgrade(&app, worker_response, preserve_representation_length).await
+        }
         Err(error) if request_body_limit_error(&error) => {
             response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
         }
@@ -2822,9 +2799,13 @@ async fn internal_log(request: Request<Incoming>, app: AppHandle, path: String) 
             },
             Err(error) => Err(error.into()),
         },
-        "/peer/log/tail" => serde_json::from_slice::<celld::node_log::TailReq>(&body)
-            .map_err(anyhow::Error::from)
-            .map(|req| celld::node_log::encode_tail_resp(&follower.tail(&req))),
+        "/peer/log/tail" => match serde_json::from_slice::<celld::node_log::TailWireReq>(&body) {
+            Ok(req) => match follower.tail(&req.request).await {
+                Ok(response) => req.encode_response(&response),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error.into()),
+        },
         _ => Err(anyhow::anyhow!("unknown log endpoint")),
     };
     match result {
@@ -3011,6 +2992,7 @@ async fn handle_internal(
             // consumer. The runtime also proves that this name hashes to the
             // requested scope before it exposes the identity to JavaScript.
             dispatch_cell_fetch(
+                &app,
                 scope,
                 name,
                 "http://cell/".to_string(),
@@ -3058,9 +3040,9 @@ async fn handle_internal(
             .await
             {
                 Ok(payload) => payload,
-                Err(response) => return Ok(response),
+                Err(response) => return Ok(*response),
             };
-            dispatch_cell_fetch(cell, None, url, method, body, headers).await
+            dispatch_cell_fetch(&app, cell, None, url, method, body, headers).await
         }
         _ if cell_scope.is_some() => {
             let cell = cell_scope.expect("checked prefix");
@@ -3488,7 +3470,8 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     };
     #[cfg(not(all(test, celld_internal_tests)))]
     let action = action_from_process()?;
-    celld::asyncrt::set_host_handle(tokio::runtime::Handle::current());
+    let host_runtime = tokio::runtime::Handle::current();
+    celld::asyncrt::set_host_handle(host_runtime.clone());
     // Docker and journald can stop consuming the process pipe during a log
     // burst. Logging must lose diagnostics under that backpressure rather
     // than block the Tokio workers that route requests and renew authority.
@@ -3656,6 +3639,14 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         .flatten()
         .map(|database| celld::local_storage::lock_runtime(&database))
         .transpose()?;
+    // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
+    // a count of process threads also includes unrelated, lazily started
+    // thread pools, so it cannot stand in for this value.
+    tracing::info!(
+        event = "host_runtime",
+        worker_count = host_runtime.metrics().num_workers(),
+        "host runtime initialized"
+    );
     celld::startup::raise_file_limit();
     let max_resident = celld::env_vars::optional("CELLD_MAX_RESIDENT_CELLS")?
         // celld has no resident ceiling unless the operator configures one.
@@ -3803,77 +3794,237 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // watcher through. Without a deployment bucket the receiver is dropped
     // and a reload reports that there is no pointer to reload from.
     let (reload_tx, reload_rx) = celld::generation::reload_channel();
-    let (runtime, ownership, peer_key, wake_scan, deploy_bucket) =
-        if settings.bucket.is_some() && settings.load_deployment {
+    let (runtime, ownership, peer_key, wake_scan, deploy_bucket) = if settings.bucket.is_some()
+        && settings.load_deployment
+    {
+        let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+        if settings.control_plane {
+            fleet::validate_managed_bucket(&client).await?;
+        } else {
+            fleet::validate_bucket(&client).await?;
+        }
+        celld::wake_format::ensure_ready_with_runtime_lock(&client, _local_store_guard.as_ref())
+            .await?;
+        // The list above proves the bucket answers; it does not prove the
+        // store enforces the conditional writes or ranged reads that a
+        // cell needs. Test both contracts here before the node serves.
+        fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
+        let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+        if settings.control_plane {
+            celld::control_plane::wait_for_initial_deployment(&client).await?;
+            deploy_agent = Some(client.clone());
+        } else {
+            // A self-hosted node can start before its first `celld
+            // deploy`; wait for the pointer instead of exiting, or
+            // systemd restarts the node in a loop until a deployment
+            // exists. Managed mode already waited above.
+            fleet::wait_for_deployment_pointer(&client).await?;
+        }
+        let peer_key = peer_auth::load_or_create(&client).await?;
+        let graph = DeploymentGraph::load(&client, node.clone()).await?;
+        let wake = Arc::new(celld::wake::WakeFlusher::new());
+        celld::js::set_arm_gate(ArmGate {
+            bucket: client.clone(),
+            flusher: wake.clone(),
+        });
+        // An `r2_buckets` binding lives in the fleet bucket, under the
+        // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
+        // rather than providing it, so a binding gets the store the node
+        // already holds credentials for instead of a second one.
+        celld::js::set_r2_store(client.clone());
+        // celld treats replication as a node service, not as a property
+        // of today's manifest. Start it even for a stateless deployment
+        // so a later deployment can introduce cells without changing the
+        // durability contract underneath the node.
+        let replication = Some(Replication::start(
+            client.clone(),
+            &data_dir,
+            settings.endpoint.clone(),
+            settings.region.clone(),
+            storage_credentials.clone(),
+        )?);
+        // The same two calls a reload makes: there is no boot-only way from
+        // a deployment to a serving generation.
+        let generation = Generation::build(
+            FIRST_GENERATION,
+            graph,
+            GenerationOptions {
+                node: node.clone(),
+                region: settings.region.clone(),
+            },
+        )?;
+        let runtime = RuntimeManager::start(
+            generation,
+            RuntimeOptions {
+                data_dir: data_dir.clone(),
+                replication,
+                wake: Some(wake.clone()),
+                alarm_observer: alarm_observer.clone(),
+                node: node.clone(),
+                region: settings.region.clone(),
+                bucket: Some(client.clone()),
+            },
+        )?;
+        let deploy_bucket = Some(client.clone());
+        let bucket_ownership = Arc::new(
+            BucketOwnership::new(
+                client.clone(),
+                lease_client,
+                node.clone(),
+                probe_public_key.clone(),
+            )
+            .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+            .with_fleet_sample_ms(fleet_sample_ms),
+        );
+        let wake_scan = Some((client, bucket_ownership.clone()));
+        let ownership = Ownership::Bucket(bucket_ownership);
+        (
+            Some(runtime),
+            Some(ownership),
+            peer_key,
+            wake_scan,
+            deploy_bucket,
+        )
+    } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
+        let source = std::fs::read_to_string(&script_path)?;
+        let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
+            .filter(|(name, class)| !name.is_empty() && !class.is_empty())
+            .collect();
+        // `BINDING=database` pairs, the local-script equivalent of
+        // `d1_databases` in a deployed project.
+        let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
+            .filter(|(name, database)| !name.is_empty() && !database.is_empty())
+            .collect();
+        // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
+        // for the reason D1's and Workflows' equivalents landed on day one:
+        // every runtime test needs it.
+        let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
+            .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+            .collect();
+        // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
+        // producer. A local binding has no configuration object for a default
+        // delay, so it uses the Queue default of zero.
+        let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(environment, queue)| QueueBinding {
+                environment: environment.trim().to_string(),
+                queue: queue.trim().to_string(),
+                delivery_delay: 0,
+            })
+            .filter(|binding| !binding.environment.is_empty() && !binding.queue.is_empty())
+            .collect();
+        for binding in &queue_bindings {
+            anyhow::ensure!(
+                celld_logic::cell::valid_cell_scope(&binding.queue),
+                "local Queue binding {} has a queue name that cannot name a cell: {:?}",
+                binding.environment,
+                binding.queue,
+            );
+        }
+        // `BINDING=bucket` pairs, the local-script equivalent of
+        // `r2_buckets` in a deployed project.
+        let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
+            .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
+            .collect();
+        let mut do_classes: Vec<String> = do_classes;
+        if !d1_bindings.is_empty() {
+            do_classes.push(celld::deploy::D1_CLASS.to_string());
+        }
+        if !kv_bindings.is_empty() {
+            do_classes.push(celld::deploy::KV_CLASS.to_string());
+        }
+        if !queue_bindings.is_empty() {
+            do_classes.push(celld::deploy::QUEUE_CLASS.to_string());
+        }
+        let workflow_bindings: Vec<WorkflowBinding> =
+            std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| {
+                    let (binding, rest) = value.split_once('=')?;
+                    let (name, class) = rest.split_once('=')?;
+                    Some(WorkflowBinding {
+                        environment: binding.trim().to_string(),
+                        workflow: name.trim().to_string(),
+                        class: class.trim().to_string(),
+                    })
+                })
+                .filter(|binding| {
+                    !binding.environment.is_empty()
+                        && !binding.workflow.is_empty()
+                        && !binding.class.is_empty()
+                })
+                .collect();
+        // Resolved before the config is built, because the reserved workflow
+        // class is script-scoped and `do_classes` has to carry the scoped name.
+        let script_name =
+            std::env::var("CELLD_TEST_SCRIPT_NAME").unwrap_or_else(|_| "celld-local".to_string());
+        if !workflow_bindings.is_empty() {
+            do_classes.push(celld::deploy::workflow_class(&script_name));
+        }
+        let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        let options = WorkerConfigOptions {
+            src: source,
+            script_name,
+            do_classes,
+            bindings,
+            r2_bindings,
+            d1_bindings,
+            kv_bindings,
+            queue_bindings,
+            queue_consumers: Vec::new(),
+            workflow_bindings,
+            vars: Vec::new(),
+            node: node.clone(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        };
+        let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
             let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-            if settings.control_plane {
-                fleet::validate_managed_bucket(&client).await?;
-            } else {
-                fleet::validate_bucket(&client).await?;
-            }
-            celld::wake_format::ensure_ready_with_runtime_lock(&client, _local_store_guard.as_ref())
-                .await?;
-            // The list above proves the bucket answers; it does not prove the
-            // store enforces the conditional writes or ranged reads that a
-            // cell needs. Test both contracts here before the node serves.
-            fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
+            celld::wake_format::ensure_ready_with_runtime_lock(
+                &client,
+                _local_store_guard.as_ref(),
+            )
+            .await?;
             let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-            if settings.control_plane {
-                celld::control_plane::wait_for_initial_deployment(&client).await?;
-                deploy_agent = Some(client.clone());
-            } else {
-                // A self-hosted node can start before its first `celld
-                // deploy`; wait for the pointer instead of exiting, or
-                // systemd restarts the node in a loop until a deployment
-                // exists. Managed mode already waited above.
-                fleet::wait_for_deployment_pointer(&client).await?;
-            }
             let peer_key = peer_auth::load_or_create(&client).await?;
-            let graph = DeploymentGraph::load(&client, node.clone()).await?;
             let wake = Arc::new(celld::wake::WakeFlusher::new());
             celld::js::set_arm_gate(ArmGate {
                 bucket: client.clone(),
                 flusher: wake.clone(),
             });
-            // An `r2_buckets` binding lives in the fleet bucket, under the
-            // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
-            // rather than providing it, so a binding gets the store the node
-            // already holds credentials for instead of a second one.
             celld::js::set_r2_store(client.clone());
-            // celld treats replication as a node service, not as a property
-            // of today's manifest. Start it even for a stateless deployment
-            // so a later deployment can introduce cells without changing the
-            // durability contract underneath the node.
-            let replication = Some(Replication::start(
-                client.clone(),
-                &data_dir,
-                settings.endpoint.clone(),
-                settings.region.clone(),
-                storage_credentials.clone(),
-            )?);
-            // The same two calls a reload makes: there is no boot-only way from
-            // a deployment to a serving generation.
-            let generation = Generation::build(
-                FIRST_GENERATION,
-                graph,
-                GenerationOptions {
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                },
-            )?;
-            let runtime = RuntimeManager::start(
-                generation,
-                RuntimeOptions {
-                    data_dir: data_dir.clone(),
-                    replication,
-                    wake: Some(wake.clone()),
-                    alarm_observer: alarm_observer.clone(),
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                    bucket: Some(client.clone()),
-                },
-            )?;
-            let deploy_bucket = Some(client.clone());
             let bucket_ownership = Arc::new(
                 BucketOwnership::new(
                     client.clone(),
@@ -3885,250 +4036,97 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 .with_fleet_sample_ms(fleet_sample_ms),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
-            let ownership = Ownership::Bucket(bucket_ownership);
             (
-                Some(runtime),
-                Some(ownership),
+                Some(Ownership::Bucket(bucket_ownership)),
                 peer_key,
+                Some(wake),
                 wake_scan,
-                deploy_bucket,
             )
-        } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
-            let source = std::fs::read_to_string(&script_path)?;
-            let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect();
-            let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
-                .filter(|(name, class)| !name.is_empty() && !class.is_empty())
-                .collect();
-            // `BINDING=database` pairs, the local-script equivalent of
-            // `d1_databases` in a deployed project.
-            let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
-                .filter(|(name, database)| !name.is_empty() && !database.is_empty())
-                .collect();
-            // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
-            // for the reason D1's and Workflows' equivalents landed on day one:
-            // every runtime test needs it.
-            let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
-                .filter(|(name, id)| !name.is_empty() && !id.is_empty())
-                .collect();
-            // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
-            // producer. A local binding has no configuration object for a default
-            // delay, so it uses the Queue default of zero.
-            let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(environment, queue)| QueueBinding {
-                    environment: environment.trim().to_string(),
-                    queue: queue.trim().to_string(),
-                    delivery_delay: 0,
-                })
-                .filter(|binding| !binding.environment.is_empty() && !binding.queue.is_empty())
-                .collect();
-            for binding in &queue_bindings {
-                anyhow::ensure!(
-                    celld_logic::cell::valid_cell_scope(&binding.queue),
-                    "local Queue binding {} has a queue name that cannot name a cell: {:?}",
-                    binding.environment,
-                    binding.queue,
-                );
-            }
-            // `BINDING=bucket` pairs, the local-script equivalent of
-            // `r2_buckets` in a deployed project.
-            let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
-                .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
-                .collect();
-            let mut do_classes: Vec<String> = do_classes;
-            if !d1_bindings.is_empty() {
-                do_classes.push(celld::deploy::D1_CLASS.to_string());
-            }
-            if !kv_bindings.is_empty() {
-                do_classes.push(celld::deploy::KV_CLASS.to_string());
-            }
-            if !queue_bindings.is_empty() {
-                do_classes.push(celld::deploy::QUEUE_CLASS.to_string());
-            }
-            let workflow_bindings: Vec<WorkflowBinding> =
-                std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+        } else {
+            (None, random_peer_key(), None, None)
+        };
+        // A local script is a one-script deployment with no pointer behind
+        // it, built through the same function as a bucket deployment.
+        let script_name = options.script_name.clone();
+        let generation = Generation::build(
+            FIRST_GENERATION,
+            DeploymentGraph::single(fleet::LoadedDeployment {
+                options,
+                script_name,
+                version: "local".to_string(),
+                prefix: script_path.clone(),
+                asset_binding: None,
+                // A bare script has no wrangler config, so this names the
+                // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
+                // a comma-separated list, because a config can declare
+                // more than one loader. It is the local-script equivalent
+                // of `worker_loaders`, and not a production switch: a
+                // deployed project reaches a loader only through its own
+                // config.
+                loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
                     .unwrap_or_default()
                     .split(',')
-                    .filter_map(|value| {
-                        let (binding, rest) = value.split_once('=')?;
-                        let (name, class) = rest.split_once('=')?;
-                        Some(WorkflowBinding {
-                            environment: binding.trim().to_string(),
-                            workflow: name.trim().to_string(),
-                            class: class.trim().to_string(),
-                        })
-                    })
-                    .filter(|binding| {
-                        !binding.environment.is_empty()
-                            && !binding.workflow.is_empty()
-                            && !binding.class.is_empty()
-                    })
-                    .collect();
-            // Resolved before the config is built, because the reserved workflow
-            // class is script-scoped and `do_classes` has to carry the scoped name.
-            let script_name = std::env::var("CELLD_TEST_SCRIPT_NAME")
-                .unwrap_or_else(|_| "celld-local".to_string());
-            if !workflow_bindings.is_empty() {
-                do_classes.push(celld::deploy::workflow_class(&script_name));
-            }
-            let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
-                .unwrap_or_default()
-                .split(';')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect();
-            let options = WorkerConfigOptions {
-                src: source,
-                script_name,
-                do_classes,
-                bindings,
-                r2_bindings,
-                d1_bindings,
-                kv_bindings,
-                queue_bindings,
-                queue_consumers: Vec::new(),
-                workflow_bindings,
-                vars: Vec::new(),
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                assets: None,
+                services: Vec::new(),
+                crons,
+                containers: Vec::new(),
+                fence_image: None,
+            }),
+            GenerationOptions {
                 node: node.clone(),
-                modules: Vec::new(),
-                compat: Compat::default(),
-            };
-            let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
-                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-                celld::wake_format::ensure_ready_with_runtime_lock(&client, _local_store_guard.as_ref())
-                .await?;
-                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-                let peer_key = peer_auth::load_or_create(&client).await?;
-                let wake = Arc::new(celld::wake::WakeFlusher::new());
-                celld::js::set_arm_gate(ArmGate {
-                    bucket: client.clone(),
-                    flusher: wake.clone(),
-                });
-                celld::js::set_r2_store(client.clone());
-                let bucket_ownership = Arc::new(
+                region: settings.region.clone(),
+            },
+        )?;
+        (
+            Some(RuntimeManager::start(
+                generation,
+                RuntimeOptions {
+                    data_dir: data_dir.clone(),
+                    replication: None,
+                    wake: wake.clone(),
+                    alarm_observer: alarm_observer.clone(),
+                    node: node.clone(),
+                    region: settings.region.clone(),
+                    bucket: None,
+                },
+            )?),
+            ownership,
+            peer_key,
+            wake_scan,
+            None,
+        )
+    } else {
+        let (ownership, peer_key) = if settings.bucket.is_some() {
+            let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+            celld::wake_format::ensure_ready_with_runtime_lock(
+                &client,
+                _local_store_guard.as_ref(),
+            )
+            .await?;
+            let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+            let peer_key = peer_auth::load_or_create(&client).await?;
+            (
+                Some(Ownership::Bucket(Arc::new(
                     BucketOwnership::new(
-                        client.clone(),
+                        client,
                         lease_client,
                         node.clone(),
                         probe_public_key.clone(),
                     )
                     .with_lease_ttl_ms(lease_ttl_ms_from_environment())
                     .with_fleet_sample_ms(fleet_sample_ms),
-                );
-                let wake_scan = Some((client, bucket_ownership.clone()));
-                (
-                    Some(Ownership::Bucket(bucket_ownership)),
-                    peer_key,
-                    Some(wake),
-                    wake_scan,
-                )
-            } else {
-                (None, random_peer_key(), None, None)
-            };
-            // A local script is a one-script deployment with no pointer behind
-            // it, built through the same function as a bucket deployment.
-            let script_name = options.script_name.clone();
-            let generation = Generation::build(
-                FIRST_GENERATION,
-                DeploymentGraph::single(fleet::LoadedDeployment {
-                    options,
-                    script_name,
-                    version: "local".to_string(),
-                    prefix: script_path.clone(),
-                    asset_binding: None,
-                    // A bare script has no wrangler config, so this names the
-                    // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
-                    // a comma-separated list, because a config can declare
-                    // more than one loader. It is the local-script equivalent
-                    // of `worker_loaders`, and not a production switch: a
-                    // deployed project reaches a loader only through its own
-                    // config.
-                    loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
-                        .unwrap_or_default()
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    assets: None,
-                    services: Vec::new(),
-                    crons,
-                    containers: Vec::new(),
-                    fence_image: None,
-                }),
-                GenerationOptions {
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                },
-            )?;
-            (
-                Some(RuntimeManager::start(
-                    generation,
-                    RuntimeOptions {
-                        data_dir: data_dir.clone(),
-                        replication: None,
-                        wake: wake.clone(),
-                        alarm_observer: alarm_observer.clone(),
-                        node: node.clone(),
-                        region: settings.region.clone(),
-                        bucket: None,
-                    },
-                )?),
-                ownership,
+                ))),
                 peer_key,
-                wake_scan,
-                None,
             )
         } else {
-            let (ownership, peer_key) = if settings.bucket.is_some() {
-                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-                celld::wake_format::ensure_ready_with_runtime_lock(&client, _local_store_guard.as_ref())
-                .await?;
-                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-                let peer_key = peer_auth::load_or_create(&client).await?;
-                (
-                    Some(Ownership::Bucket(Arc::new(
-                        BucketOwnership::new(
-                            client,
-                            lease_client,
-                            node.clone(),
-                            probe_public_key.clone(),
-                        )
-                        .with_lease_ttl_ms(lease_ttl_ms_from_environment())
-                        .with_fleet_sample_ms(fleet_sample_ms),
-                    ))),
-                    peer_key,
-                )
-            } else {
-                (None, random_peer_key())
-            };
-            (None, ownership, peer_key, None, None)
+            (None, random_peer_key())
         };
+        (None, ownership, peer_key, None, None)
+    };
     if let Some(config) = &telemetry_config {
         let sink_bucket = match &config.sink {
             celld::telemetry::SinkChoice::Bucket => {
@@ -4208,7 +4206,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let fleet_bucket = ready_ownership
         .as_ref()
         .map(|ownership| ownership.bucket_client());
-    let explorer_replication = runtime.as_ref().and_then(RuntimeManager::replication);
+    let explorer_replication = runtime.as_ref().and_then(|runtime| runtime.replication());
     let local_cache_replication = explorer_replication.clone();
     let (websocket_tx, mut websocket_rx) = mpsc::unbounded_channel();
     // The log tier's follower store (crate::node_log): fragments other
@@ -4267,7 +4265,9 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     let mut durability_owner = DurabilityOwnerSelection::new(follower.clone());
     if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
         if let (Some(replication), Some(spec)) = (
-            app.runtime.as_ref().and_then(RuntimeManager::replication),
+            app.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.replication()),
             settings.bucket.clone(),
         ) {
             let _ = spec;
@@ -4351,6 +4351,16 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     celld::js::set_do_call_tx(do_call_tx);
     let (gate_tx, mut gate_rx) = mpsc::unbounded_channel();
     celld::js::set_gate_tx(gate_tx);
+    let (facet_tx, mut facet_rx) = mpsc::unbounded_channel();
+    celld::js::set_facet_tx(facet_tx);
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            while let Some(req) = facet_rx.recv().await {
+                tokio::spawn(dispatch_facet(app.clone(), req));
+            }
+        });
+    }
     let (rpc_call_tx, mut rpc_call_rx) = mpsc::unbounded_channel();
     celld::js::set_rpc_call_tx(rpc_call_tx);
     let (service_call_tx, mut service_call_rx) = mpsc::unbounded_channel();
@@ -4371,6 +4381,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     if let Ownership::Bucket(bucket_ownership) = &actor.ownership {
         celld::js::set_kv_blob_store(bucket_ownership.bucket_client());
     }
+    // Seed `/state` and the first lease before the core starts or the ticker posts a sample.
+    let services = celld::asyncrt::services();
+    let initial_sample = tokio::task::spawn_blocking(move || services.sample_metrics()).await?;
+    actor.store_load_sample(initial_sample);
     // The core is a serial ownership actor, not a Worker executor. It owns the
     // node lease timer, so ingress, proxy retries, and restore completions must
     // not consume every scheduler turn it needs. Its isolated single-thread
@@ -4396,6 +4410,10 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         celld::asyncrt::spawn(async move {
             let mut tick = celld::asyncrt::interval(LOAD_SAMPLE_PERIOD);
             tick.set_missed_tick_behavior(celld::asyncrt::MissedTickBehavior::Delay);
+            // The seed sample above takes the CPU baseline. Sampling again on
+            // the immediate tick divides CPU clock ticks by too little time and
+            // spikes the load.
+            tick.tick().await;
             loop {
                 tick.tick().await;
                 // What SQLite freed when a cell stopped stays on the C
@@ -4405,7 +4423,20 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 // ahead of the sample, on a blocking thread because a trim
                 // walks every free chunk.
                 let _ = tokio::task::spawn_blocking(celld::memory::trim_c_heap_if_retained).await;
-                if sample_tx.send(Message::SampleLoad).is_err() {
+                let services = celld::asyncrt::services();
+                let sample =
+                    match tokio::task::spawn_blocking(move || services.sample_metrics()).await {
+                        Ok(sample) => sample,
+                        Err(error) => {
+                            tracing::warn!(
+                                event = "load_sample_failed",
+                                %error,
+                                "process load sample failed"
+                            );
+                            continue;
+                        }
+                    };
+                if sample_tx.send(Message::SampleLoad(sample)).is_err() {
                     return;
                 }
             }
@@ -5186,10 +5217,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
             // a status request is not itself allowed to bypass the drain deadline.
             let status = before_process_deadline(
                 handoff_deadline,
-                tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                app.drain_status(),
-            ),
+                tokio::time::timeout(std::time::Duration::from_millis(50), app.drain_status()),
             )
             .await
             .and_then(Result::ok);
@@ -5657,41 +5685,6 @@ fn forwarder_response_stream(
                     if let Some(mut abort) = abort.take() {
                         abort.disarm();
                     }
-                    None
-                }
-            }
-        },
-    ))
-}
-
-// The body owns the activity until EOF, cancellation, or drop. A forwarded
-// body also owns its peer-abort guard: disarm it at EOF, but retain it on a
-// dropped body so the owner cancels work for the disconnected peer.
-fn local_response_stream(
-    stream: celld::js::HttpChunkStream,
-    activity: ActivityGuard,
-    on_finish: impl FnOnce() + Send + 'static,
-) -> celld::js::HttpChunkStream {
-    let cancellation = activity.cancellation();
-    Box::pin(futures_util::stream::unfold(
-        (stream, activity, on_finish, cancellation),
-        |(mut stream, activity, on_finish, mut cancellation)| async move {
-            let chunk = if *cancellation.borrow() {
-                None
-            } else {
-                celld::asyncrt::select! {
-                    chunk = stream.next() => chunk,
-                    changed = cancellation.changed() => {
-                        let _ = changed;
-                        None
-                    }
-                }
-            };
-            match chunk {
-                Some(chunk) => Some((chunk, (stream, activity, on_finish, cancellation))),
-                None => {
-                    on_finish();
-                    drop(activity);
                     None
                 }
             }

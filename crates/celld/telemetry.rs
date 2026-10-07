@@ -346,7 +346,52 @@ pub struct Log {
     pub trace_id: Option<[u8; 16]>,
     pub span_id: Option<[u8; 8]>,
     pub time_unix_us: i64,
+    pub severity: Severity,
     pub body: String,
+}
+
+/// The OpenTelemetry severity of a console line. One value yields both the
+/// exported number and the exported text, so an exporter cannot pair a
+/// number with the wrong text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl Severity {
+    /// `console.log` and any unknown level are INFO, the level every line
+    /// carried before the console method reached the exporter.
+    pub fn from_console_level(level: &str) -> Severity {
+        match level {
+            "debug" => Severity::Debug,
+            "warn" => Severity::Warn,
+            "error" => Severity::Error,
+            _ => Severity::Info,
+        }
+    }
+
+    /// The `SeverityNumber` of the OpenTelemetry log data model: the first
+    /// value of each range.
+    pub fn number(self) -> i32 {
+        match self {
+            Severity::Debug => 5,
+            Severity::Info => 9,
+            Severity::Warn => 13,
+            Severity::Error => 17,
+        }
+    }
+
+    pub fn text(self) -> &'static str {
+        match self {
+            Severity::Debug => "DEBUG",
+            Severity::Info => "INFO",
+            Severity::Warn => "WARN",
+            Severity::Error => "ERROR",
+        }
+    }
 }
 
 impl Span {
@@ -1076,6 +1121,8 @@ message celld_log {
   optional binary trace_id (STRING);
   optional binary span_id (STRING);
   required int64 time_unix_us;
+  required int32 severity_number;
+  required binary severity_text (STRING);
   required binary body (STRING);
 }";
 
@@ -1164,6 +1211,7 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
     use parquet::basic::ZstdLevel;
     use parquet::data_type::ByteArray;
     use parquet::data_type::ByteArrayType;
+    use parquet::data_type::Int32Type;
     use parquet::data_type::Int64Type;
     use parquet::file::properties::WriterProperties;
     use parquet::file::writer::SerializedFileWriter;
@@ -1207,6 +1255,8 @@ pub fn encode_logs(logs: &[Log], node: &str, region: &str) -> anyhow::Result<Vec
     column!(ByteArrayType, opt each.clone().map(|l| l.trace_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
     column!(ByteArrayType, opt each.clone().map(|l| l.span_id.map(|id| text(&hex(&id)))).collect::<Vec<_>>());
     column!(Int64Type, req each.clone().map(|l| l.time_unix_us).collect::<Vec<_>>());
+    column!(Int32Type, req each.clone().map(|l| l.severity.number()).collect::<Vec<_>>());
+    column!(ByteArrayType, req each.clone().map(|l| text(l.severity.text())).collect::<Vec<_>>());
     column!(ByteArrayType, req each.clone().map(|l| text(&l.body)).collect::<Vec<_>>());
 
     group.close()?;

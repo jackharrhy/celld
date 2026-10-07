@@ -1,24 +1,17 @@
 # Cloudflare compatibility
 
-celld implements the Cloudflare Workers APIs that this page links to. Read the
-Cloudflare documentation for the standard behavior of each API.
+This page lists only the differences from the linked Cloudflare APIs. An entry
+without a note matches Cloudflare.
 
-This page lists only an unavailable feature, a celld-specific limit, or an
-observable difference. If an entry has no note, celld intends to match the
-linked Cloudflare API.
+- **Yes**: implemented, except for the listed differences.
+- **Partial**: a substantial part is unavailable.
+- **Experimental**: can change without notice.
+- **No**: not implemented.
 
-- **Yes** means that celld implements the API, except for the listed differences.
-- **Partial** means that a substantial part of the API is unavailable.
-- **Experimental** means that celld can change the API without notice.
-- **No** means that celld does not implement the API.
-
-celld must reject an unsupported configuration or API at deployment or first
-use. An unsupported feature that does not cause an error is a defect.
+celld rejects an unsupported configuration or API at deployment or first use.
+An unsupported feature that does not cause an error is a defect.
 
 ## Services
-
-Each supported service has a page with an example and the known differences
-from Cloudflare.
 
 | service | status |
 | --- | --- |
@@ -39,7 +32,7 @@ from Cloudflare.
 | Hyperdrive | **No** |
 | Browser Rendering | **No** |
 | Email Workers | **No** |
-| Python Workers | **No** |
+| [Python Workers](services/workers.md#python-workers) | **Partial** — `fetch` handlers on the Pyodide 0.28 runtime line |
 
 ## Runtime APIs
 
@@ -80,8 +73,7 @@ from Cloudflare.
 
 ### [Bindings](https://developers.cloudflare.com/workers/runtime-apis/bindings/)
 
-The [services table](#services) lists the available binding types. Each binding
-type that the table does not list is unavailable.
+Only the binding types in the [services table](#services) are available.
 
 ### [Context](https://developers.cloudflare.com/workers/runtime-apis/context/)
 
@@ -119,6 +111,12 @@ The `tail` and `email` handlers are unavailable.
   If the owner connection fails between frames before a Close, the ingress sends
   code 1012. If a frame is incomplete, the ingress closes the transport instead.
 - `acceptWebSocket()` throws above 90 percent of the V8 heap limit.
+- A response with a WebSocket to a request without `Upgrade: websocket` fails,
+  as in workerd. A Durable Object's `stub.fetch()` call then rejects, and an
+  HTTP client receives status 500. The server end of the socket receives a close
+  event with code 1006.
+- A Durable Object's `stub.fetch()` call rejects when the handler fails, on the
+  owner node and on any other node.
 
 ### [Web Crypto](https://developers.cloudflare.com/workers/runtime-apis/web-crypto/)
 
@@ -128,6 +126,12 @@ The `tail` and `email` handlers are unavailable.
 - RSA-OAEP accepts SHA-1, SHA-256, SHA-384, and SHA-512. A nonempty label must
   contain valid UTF-8.
 - A secret key cannot use `jwk` with `exportKey()` or `wrapKey()`.
+- Ed25519 signs and verifies, and `NODE-ED25519` names the same algorithm. A
+  signature from one spelling verifies under the other.
+- X25519 derives bits and keys. A peer key of a low order gives a shared secret
+  of all zero bytes, so `deriveBits()` rejects that key instead.
+- An Ed25519 or X25519 public key uses its 32-byte point for the `raw` format,
+  so `importKey()` and `exportKey()` both carry the point alone.
 
 ### [Web standards](https://developers.cloudflare.com/workers/runtime-apis/web-standards/)
 
@@ -151,17 +155,13 @@ execution.
 - `node:fs` provides `access`, `mkdir`, `realpath`, `stat`, `lstat`, and
   `readFile`. It exposes an empty, request-local `/tmp` and a read-only
   `/bundle` that contains the Worker modules.
-- The global `process` gives each field that it defines the same value that
-  workerd gives it, so a dependency that reads `process.execPath`,
-  `process.argv`, or `process.title` at module scope can load. celld does not
-  define the full workerd surface, so a field such as `process.kill` or
-  `process.features` is undefined.
+- The global `process` matches workerd for each field that it defines, such
+  as `process.execPath`, `process.argv`, and `process.title`. Other fields,
+  such as `process.kill` and `process.features`, are undefined.
 - The celld bundler supports a synchronous CommonJS `require()` of a Node.js
   built-in module. A raw ESM Worker has no global `require()`.
-- A Node.js built-in module object is writable, so a CommonJS dependency that
-  replaces a function on the module at load can start. The `graceful-fs`
-  package replaces `fs.close` this way. A patch stays in the isolate that
-  applies it, therefore another Worker never observes the patch.
+- A Node.js built-in module object is writable, so a dependency such as
+  `graceful-fs` can patch it at load. The patch stays in its isolate.
 - An import of another Node.js module succeeds, but its first call throws an
   error.
 
@@ -181,12 +181,11 @@ celld provides an always-miss cache because it has no shared edge cache.
 
 ### BroadcastChannel
 
-celld defines the class so that a bundle can load, but its constructor throws an
-error.
+The class exists so that a bundle can load, but its constructor throws.
 
 ## Compatibility flags
 
-celld honors these compatibility switches:
+celld honors these compatibility flags:
 
 - `delete_all_deletes_alarm`
 - `js_rpc`
@@ -195,18 +194,18 @@ celld honors these compatibility switches:
 - `websocket_standard_binary_type`
 - The static-assets navigation flags
 
-celld accepts each other compatibility flag without effect.
-`Cloudflare.compatibilityFlags` reports only the flags that celld honors.
+celld accepts every other flag without effect.
+`Cloudflare.compatibilityFlags` reports only the honored flags.
 
 ## Wrangler configuration
 
-`celld deploy` accepts `wrangler.jsonc` or `wrangler.json`. It does not accept
+`celld deploy` accepts `wrangler.jsonc` or `wrangler.json`, not
 `wrangler.toml`.
 
 The `name` value must contain 1 to 63 lowercase ASCII letters, digits, or
 internal hyphens. It cannot start or end with a hyphen.
 
-The deployment accepts these top-level keys:
+The accepted top-level keys:
 
 - `$schema`, `name`, `main`, and `no_bundle`
 - `compatibility_date` and `compatibility_flags`
@@ -217,26 +216,18 @@ The deployment accepts these top-level keys:
 - `worker_loaders` and `containers`
 - `define` and `rules`
 
-Each other top-level key, including `routes`, stops the deployment.
+Any other top-level key, including `routes`, stops the deployment.
 
-`celld deploy` bundles with esbuild, and it gives `define` and `rules` to that
-run. Each `define` value is a JavaScript expression, as it is for Wrangler.
-A rule must have a `type` of `Text`, `Data`, or `CompiledWasm`, and each of its
-globs must have the form `**/*.ext` or `*.ext`: esbuild selects a loader by
-file extension, so celld refuses a glob that selects a different set of files.
-
-Two rules can name one extension only if they give it the same type. Two rules
-that give one extension different types stop the deployment, because no single
-loader satisfies both. celld applies a `CompiledWasm` rule to `**/*.wasm`
-already, so a `CompiledWasm` rule for that extension agrees with the built-in
-rule and the deployment continues. Another type for `**/*.wasm` stops the
+`define` and `rules` go to the esbuild run. Each `define` value is a
+JavaScript expression, as in Wrangler. A rule `type` must be `Text`, `Data`,
+or `CompiledWasm`, and each glob must have the form `**/*.ext` or `*.ext`,
+because esbuild selects a loader by extension. Two rules that give one
+extension different types stop the deployment. celld already applies
+`CompiledWasm` to `**/*.wasm`, so only that type is valid for `.wasm`.
+`no_bundle` skips esbuild, so `no_bundle` with `define` or `rules` stops the
 deployment.
 
-`no_bundle` does not run esbuild. A config that sets `no_bundle` with `define`
-or `rules` therefore stops the deployment.
+An asset-only project can omit `main`. `celld deploy` refuses an unsafe asset
+path, and `.assetsignore` requires Wrangler.
 
-An asset-only project can omit `main`. The native deploy command refuses an
-unsafe asset path, and `.assetsignore` requires Wrangler.
-
-See [Limitations](limitations.md) for the operating-system, networking,
-security, pressure, and update boundaries.
+See [Limitations](limitations.md) for the operational limits.

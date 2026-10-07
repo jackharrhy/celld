@@ -1309,7 +1309,18 @@ fn cleanup_cache_files(root: &Path, limit: u64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Report the same size-policy mismatch in the builder, managed agent, and serving node.
+pub(crate) fn validate_asset_file_size(path: &str, bytes: u64, limit: u64) -> anyhow::Result<()> {
+    if bytes > limit {
+        return Err(anyhow!(
+            "asset {path:?} size ({bytes} bytes) exceeds CELLD_MAX_ASSET_FILE_BYTES ({limit} bytes)"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_index(index: &AssetIndex, reference: &AssetManifestRef) -> anyhow::Result<()> {
+    let max_file_bytes = crate::env_vars::max_asset_file_bytes()?;
     if index.schema_version != 1 {
         return Err(anyhow!(
             "unsupported asset index schema: {}",
@@ -1374,13 +1385,11 @@ fn validate_index(index: &AssetIndex, reference: &AssetManifestRef) -> anyhow::R
     }
     let mut total = 0_u64;
     for (path, entry) in &index.entries {
-        if !is_canonical_asset_path(path)
-            || path == "/"
-            || asset_blob_key(&entry.sha256).is_none()
-            || entry.bytes > 25 * 1024 * 1024
+        if !is_canonical_asset_path(path) || path == "/" || asset_blob_key(&entry.sha256).is_none()
         {
             return Err(anyhow!("invalid asset index entry: {path:?}"));
         }
+        validate_asset_file_size(path, entry.bytes, max_file_bytes)?;
         if entry
             .content_type
             .as_deref()

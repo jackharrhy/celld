@@ -222,6 +222,7 @@ mod local_migration_tests {
 
     #[tokio::test]
     async fn local_migration_contract() {
+        crate::asyncrt::set_host_handle(tokio::runtime::Handle::current());
         migration_requires_local_authority_and_ready_deploys_remain_online().await;
         interrupted_legacy_inventory_resumes_and_preserves_application_objects().await;
         live_legacy_lease_prevents_migration_without_publishing_marker().await;

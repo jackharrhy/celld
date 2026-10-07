@@ -247,10 +247,17 @@ async fn serve_do(upgraded: hyper::upgrade::Upgraded, app: AppHandle) {
                 ForwardedFetchOutcome::WebSocket { target, headers } => (target, headers),
             };
             let Some((accept, upgrade)) = client_upgrade else {
-                return Ok(peer_response(response(
-                    StatusCode::BAD_GATEWAY,
-                    "the cell accepted a WebSocket for a request that did not upgrade",
-                )));
+                // `dispatch_forwarded_fetch` refuses a request without
+                // `Upgrade: websocket`, so this branch sees only a request
+                // that names the upgrade but is not a valid handshake. The
+                // socket is registered with the core by now, and the refusal
+                // must release it.
+                let refusal = super::websocket::refuse_websocket_without_upgrade(
+                    &app,
+                    HttpResponseWebSocket::Cell(target),
+                )
+                .await;
+                return Ok(peer_response(refusal));
             };
             // The cell accepted: hand the inner stream to the same socket
             // task a local client gets, and answer with the real 101. The

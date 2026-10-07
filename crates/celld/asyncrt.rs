@@ -58,8 +58,13 @@ impl ProductionDomain {
     }
 }
 
+// No lazy initialization: a first call from a thread whose current runtime is
+// not the shared one, such as the core's, would bind every later spawn to that
+// runtime and silently put effect work back on the lease timer thread.
 fn current_domain() -> &'static ProductionDomain {
-    PROCESS_DOMAIN.get_or_init(|| ProductionDomain::new(tokio::runtime::Handle::current()))
+    PROCESS_DOMAIN
+        .get()
+        .expect("asyncrt::set_host_handle must run before the first spawn or domain access")
 }
 
 struct ProductionDomainOwner {
@@ -181,9 +186,13 @@ impl<T> Future for TaskHandle<T> {
     }
 }
 
-/// Install the process runtime handle.
+/// Install the process runtime handle, exactly once. A second call would
+/// otherwise be ignored and leave the first runtime in place.
 pub fn set_host_handle(handle: tokio::runtime::Handle) {
-    let _ = PROCESS_DOMAIN.set(ProductionDomain::new(handle));
+    assert!(
+        PROCESS_DOMAIN.set(ProductionDomain::new(handle)).is_ok(),
+        "asyncrt::set_host_handle must run exactly once"
+    );
 }
 
 /// Return the Tokio handle for the V8 arm.

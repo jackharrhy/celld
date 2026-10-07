@@ -340,7 +340,9 @@ that state across a restart. A configuration change does not migrate the\n\
 state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
-as for wrangler dev. Its entries override the vars of the config.\n\n\
+as for wrangler dev. Without one, .env and then .env.local supply them, and\n\
+an entry of these files that cannot be a binding is skipped with a warning.\n\
+The entries override the vars of the config.\n\n\
 OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
@@ -481,34 +483,103 @@ async fn open_store(state: &Path, console: &Console) -> anyhow::Result<Store> {
     Ok(Store { database })
 }
 
-/// The Worker variables of `.dev.vars` beside the config, in the dotenv form
-/// `wrangler dev` reads. They override the `vars` of the config. Only
-/// `celld dev` reads the file, so a local credential cannot reach a fleet.
-#[allow(clippy::disallowed_methods)] // The project is on the operator's host filesystem.
-fn read_dev_vars(config: &Path) -> anyhow::Result<BTreeMap<String, String>> {
-    let path = config.with_file_name(".dev.vars");
-    if !path.exists() {
-        return Ok(BTreeMap::new());
+/// The Worker variables for `celld dev`, from the files that `wrangler dev`
+/// reads beside the config (Wrangler getVarsForDev()). A `.dev.vars` file
+/// wins outright. Without one, `.env` and then `.env.local` apply, and a later
+/// file overrides an earlier one. Each entry overrides the `vars` of the
+/// config. Only `celld dev` reads the files, so a local credential cannot
+/// reach a fleet.
+fn read_dev_vars(config: &Path) -> anyhow::Result<deploy::VarOverrides> {
+    // A present `.dev.vars` replaces the dotenv files even when it is empty,
+    // as in Wrangler, so an entry that the project keeps in `.env` for
+    // another tool does not reach the Worker beside it.
+    if let Some(contents) = read_optional(&config.with_file_name(".dev.vars"))? {
+        return Ok(deploy::VarOverrides::DevVars(parse_dotenv(&contents)));
     }
-    let contents =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| line.split_once('='))
-        .map(|(name, value)| (name.trim(), value.trim()))
-        .filter(|(name, _)| !name.is_empty())
-        .map(|(name, value)| {
+    let mut vars = BTreeMap::new();
+    for name in [".env", ".env.local"] {
+        if let Some(contents) = read_optional(&config.with_file_name(name))? {
+            vars.extend(parse_dotenv(&contents));
+        }
+    }
+    Ok(deploy::VarOverrides::DotEnv(vars))
+}
+
+/// The contents of `path`, or `None` when it does not exist. One read, not an
+/// existence probe and then a read, so a file that vanishes between the two
+/// cannot fail the build.
+#[allow(clippy::disallowed_methods)] // The project is on the operator's host filesystem.
+fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn parse_dotenv(contents: &str) -> BTreeMap<String, String> {
+    let mut vars = BTreeMap::new();
+    let mut lines = contents.lines();
+    while let Some(line) = lines.next() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        // dotenv accepts the `export NAME=value` form of a shell-sourced
+        // file. Without the strip, the name `export NAME` fails binding
+        // validation, and a `.env` that loaded before stops the build.
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.is_empty() {
+            continue;
+        }
+        let value = match quoted_lines(value, &mut lines) {
+            Some(value) => value,
             // One matched pair of quotes comes off; a lone quote is part of
             // the value, as in dotenv, so a secret that ends in one survives.
-            let value = ['"', '\'']
+            None => ['"', '\'']
                 .into_iter()
                 .find_map(|quote| value.strip_prefix(quote)?.strip_suffix(quote))
-                .unwrap_or(value);
-            (name.to_string(), value.to_string())
-        })
-        .collect())
+                .unwrap_or(value)
+                .to_string(),
+        };
+        vars.insert(name.to_string(), value);
+    }
+    vars
+}
+
+/// A quoted value that continues on the following lines, as dotenv reads a
+/// PEM key, joined by newlines without its quotes. Line by line, each base64
+/// line of the key became a variable of its own or a name that fails binding
+/// validation. `None` leaves `lines` untouched: the value ends on its own
+/// line, or no later line closes the quote, so the opening quote is a lone
+/// character of a one-line value.
+fn quoted_lines(value: &str, lines: &mut std::str::Lines<'_>) -> Option<String> {
+    let quote = value
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '"' | '\''))?;
+    let first = &value[1..];
+    if first.ends_with(quote) {
+        return None;
+    }
+    let mut rest = lines.clone();
+    let mut joined = first.to_string();
+    while let Some(line) = rest.next() {
+        joined.push('\n');
+        match line.trim_end().strip_suffix(quote) {
+            Some(last) => {
+                joined.push_str(last);
+                *lines = rest;
+                return Some(joined);
+            }
+            None => joined.push_str(line),
+        }
+    }
+    None
 }
 
 async fn deploy_project(config: &Path, store: &Store, logs: bool) -> anyhow::Result<()> {

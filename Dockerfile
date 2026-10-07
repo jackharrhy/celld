@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-ARG RUST_VERSION=1.94.1
+ARG RUST_VERSION=1.98.1
 ARG CELLD_COMMIT=unknown
 
 FROM rust:${RUST_VERSION}-bookworm AS build
@@ -53,6 +53,7 @@ LABEL org.opencontainers.image.title="celld" \
       org.opencontainers.image.version="${CELLD_VERSION}" \
       org.opencontainers.image.source="https://github.com/jackharrhy/celld" \
       dev.celld.upstream.revision="${CELLD_UPSTREAM_COMMIT}"
+COPY LICENSE NOTICE /usr/share/doc/celld/
 COPY --from=test /out/celld /usr/local/bin/celld
 COPY --from=test /out/celld-store-copy /usr/local/bin/celld-store-copy
 ENTRYPOINT ["/usr/local/bin/celld"]

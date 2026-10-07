@@ -38,6 +38,9 @@ use celld_logic::isolate::Refusal;
 
 use crate::js;
 
+pub use crate::engine_api::AdmitError;
+pub use crate::engine_api::PoolCensus;
+
 /// Heap identity is process-wide because pressure policy compares cells from
 /// every script pool and every draining generation. A counter inside `Pool`
 /// would reproduce the collision this identity prevents. The core treats the
@@ -163,6 +166,9 @@ pub struct Slot {
     /// The index used only inside this pool's placement snapshot and slot
     /// vector. Distinct pools can use the same value.
     pub id: IsolateId,
+    /// This slot, for an op of one of its turns to reach it: a facet of the
+    /// script's own class runs in the isolate of the object that holds it.
+    me: std::sync::Weak<Slot>,
     /// The identity reported to node-wide Actor and pressure policy.
     heap_id: HeapId,
     /// The async gate, holding the isolate it guards. Locking this is what
@@ -180,6 +186,13 @@ pub struct Slot {
     /// The pool's admission bell, cloned into every slot so an
     /// `Affiliation` drop can ring it without holding the pool.
     freed: Arc<tokio::sync::Notify>,
+    /// The pool's reclaim bell, rung when a retiring isolate may have
+    /// drained. `None` for a standalone slot: nothing frees or replaces it,
+    /// so [`Slot::condemn`] cannot apply to it.
+    reclaim: Option<Arc<tokio::sync::Notify>>,
+    /// The slot holds a Worker Loader's Worker, so the facets it runs belong
+    /// to the root that started them rather than to this isolate.
+    loaded_worker: bool,
     /// Cells whose realm lives in this isolate. Not a count of live work: a
     /// cell stays until it is evicted or handed to another node, which is
     /// why `retire` refuses an isolate holding any.
@@ -190,6 +203,17 @@ pub struct Slot {
     retiring: AtomicBool,
     #[cfg(celld_internal_tests)]
     turn_observations: Mutex<Vec<String>>,
+}
+
+thread_local! {
+    static CURRENT_SLOT: std::cell::RefCell<Option<std::sync::Weak<Slot>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The slot whose turn this thread runs, for an op that must reach its own
+/// isolate again after the turn.
+pub(crate) fn current_slot() -> Option<Arc<Slot>> {
+    CURRENT_SLOT.with_borrow(|slot| slot.as_ref().and_then(std::sync::Weak::upgrade))
 }
 
 impl Slot {
@@ -238,7 +262,10 @@ impl Slot {
             TurnLane::Stateless => "stateless".to_string(),
             TurnLane::Cell(scope) => scope,
         });
-        f(worker)
+        let previous = CURRENT_SLOT.replace(Some(self.me.clone()));
+        let result = f(worker);
+        CURRENT_SLOT.set(previous);
+        result
     }
 
     /// Reserve one event through its complete lifetime, including the reply
@@ -282,12 +309,18 @@ impl Slot {
         Affiliation(self.clone())
     }
 
+    /// A slot holding a Worker Loader's Worker.
+    pub(crate) fn loaded_worker(worker: js::Worker) -> Arc<Self> {
+        Self::outside_pool(worker, true)
+    }
+
     /// A slot holding a Worker outside a placement pool.
     ///
     /// A dynamic Worker owns exactly one isolate, so it needs no
     /// admission, growth, or retirement policy.
-    pub(crate) fn standalone(worker: js::Worker) -> Arc<Self> {
-        Arc::new(Slot {
+    fn outside_pool(worker: js::Worker, loaded_worker: bool) -> Arc<Self> {
+        Arc::new_cyclic(|me| Slot {
+            me: me.clone(),
             id: 0,
             heap_id: next_heap_id(),
             worker: tokio::sync::Mutex::new(Some(worker)),
@@ -296,6 +329,8 @@ impl Slot {
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
+            reclaim: None,
+            loaded_worker,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -304,14 +339,20 @@ impl Slot {
         })
     }
 
+    /// Whether this slot holds a Worker Loader's Worker.
+    pub(crate) fn is_loaded_worker(&self) -> bool {
+        self.loaded_worker
+    }
+
     #[cfg(celld_internal_tests)]
     pub fn for_test(worker: js::Worker) -> Arc<Self> {
-        Self::standalone(worker)
+        Self::outside_pool(worker, false)
     }
 
     #[cfg(all(test, celld_internal_tests))]
     pub(crate) fn vacant_for_request_cancellation_test() -> Arc<Self> {
-        Arc::new(Slot {
+        Arc::new_cyclic(|me| Slot {
+            me: me.clone(),
             id: 0,
             heap_id: HeapId::new(0),
             worker: tokio::sync::Mutex::new(None),
@@ -320,6 +361,8 @@ impl Slot {
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             freed: Arc::new(tokio::sync::Notify::new()),
+            reclaim: None,
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(false),
@@ -367,6 +410,37 @@ impl Slot {
         self.retiring.load(Ordering::Relaxed)
     }
 
+    /// Retire this isolate because its guest can no longer run in it, and
+    /// ask the pool to free it once it drains. Returns whether the slot
+    /// belongs to a pool that can do both.
+    ///
+    /// Placement already skips a retiring slot, so the next request grows a
+    /// fresh isolate instead. Leaving the dead isolate to placement is the
+    /// failure this prevents: it fails each request in about a millisecond,
+    /// so it carries the fewest turns and `place` hands it nearly every
+    /// request. [`reap`](Self::reap) does not know it is dead, and on a
+    /// four-isolate node it retired the three healthy isolates first, one
+    /// per 30 s pass, so one fatal Python error failed that node's traffic
+    /// for 94 s.
+    ///
+    /// The bell, not the 30 s reap, frees the heap: a guest that fails on
+    /// every start would otherwise hold one dead heap per failure until the
+    /// next tick, and a Python heap is tens of megabytes.
+    ///
+    /// A cell pool has no task on the bell. A condemned cell isolate still
+    /// takes no new cell, and frees when its cells leave, as retirement
+    /// always has; Python Workers cannot declare cells.
+    pub(crate) fn condemn(&self, reason: &str) -> bool {
+        let Some(reclaim) = &self.reclaim else {
+            return false;
+        };
+        if !self.retiring.swap(true, Ordering::Relaxed) {
+            tracing::warn!(isolate = %self.heap_id, slot = self.id, reason, "isolate condemned");
+        }
+        reclaim.notify_one();
+        true
+    }
+
     /// The node-wide identity of this slot's currently installed V8 heap.
     pub fn heap_id(&self) -> HeapId {
         self.heap_id
@@ -397,6 +471,14 @@ impl Drop for Affiliation {
         // the capacity to a single parked request, where waking them all
         // would stampede `admit` on every release.
         self.0.freed.notify_one();
+        // The last request out of a retiring isolate is what lets it free.
+        // Freeing here would drop a V8 isolate inside whatever turn dropped
+        // this affiliation, so the pool's maintenance task does it.
+        if self.0.is_retiring() {
+            if let Some(reclaim) = &self.0.reclaim {
+                reclaim.notify_one();
+            }
+        }
     }
 }
 
@@ -456,39 +538,14 @@ impl Drop for Residency {
 
 type Build = Box<dyn Fn() -> Result<js::Worker> + Send + Sync>;
 
-/// One pool's isolates by state, as `/state` reports them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub struct PoolCensus {
-    /// Isolates that accept placement and work.
-    pub live: usize,
-    /// Live isolates that house no cell. The next maintenance pass retires
-    /// them, so a count that persists across passes means the pass is not
-    /// running.
-    pub live_empty: usize,
-    /// Retiring isolates whose heap is still installed, because a turn, a
-    /// request, or a cell holds it.
-    pub retiring: usize,
-    /// Slots whose heap has been freed.
-    pub freed: usize,
-    /// Cells housed across the pool.
-    pub cells: usize,
-    /// Request affiliations across the pool, running or suspended.
-    pub requests: usize,
-    /// Turns in flight across the pool.
-    pub turns: usize,
-    /// Physical memory V8 has committed to the heaps of the isolates a turn
-    /// did not hold at the sample.
-    pub heap_bytes: u64,
-    /// External memory those isolates track: array buffer stores and the
-    /// like, which live outside the V8 heap.
-    pub external_bytes: u64,
-}
-
 pub struct Pool {
     slots: RwLock<Vec<Arc<Slot>>>,
     limits: PoolLimits,
     build: Build,
     freed: Arc<tokio::sync::Notify>,
+    /// Rung by a condemnation and by the last request out of a retiring
+    /// isolate. See [`Pool::reclaim_bell`].
+    reclaim: Arc<tokio::sync::Notify>,
     admission_wait: std::time::Duration,
     /// The whole pool belongs to a superseded generation. An isolate grown
     /// after this is set starts out retiring: a placement that snapshotted
@@ -508,6 +565,7 @@ impl Pool {
             limits,
             build,
             freed: Arc::new(tokio::sync::Notify::new()),
+            reclaim: Arc::new(tokio::sync::Notify::new()),
             admission_wait,
             retired: AtomicBool::new(false),
             maintenance: RwLock::new(()),
@@ -563,7 +621,8 @@ impl Pool {
         let reusable = slots.iter().position(|slot| slot.is_reusable());
         let id = reusable.unwrap_or(slots.len());
         let heap_id = next_heap_id();
-        let slot = Arc::new(Slot {
+        let slot = Arc::new_cyclic(|me| Slot {
+            me: me.clone(),
             id,
             heap_id,
             worker: tokio::sync::Mutex::new(Some(worker)),
@@ -572,6 +631,8 @@ impl Pool {
             turns: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
             freed: self.freed.clone(),
+            reclaim: Some(self.reclaim.clone()),
+            loaded_worker: false,
             cells: AtomicUsize::new(0),
             adopted_cells: AtomicUsize::new(0),
             retiring: AtomicBool::new(self.retired.load(Ordering::Relaxed)),
@@ -705,6 +766,28 @@ impl Pool {
         self.free_retired();
     }
 
+    /// The bell a maintenance task awaits to call
+    /// [`free_drained`](Self::free_drained) between reap ticks.
+    pub(crate) fn reclaim_bell(&self) -> Arc<tokio::sync::Notify> {
+        self.reclaim.clone()
+    }
+
+    /// Free every retiring isolate that has drained, and retire nothing.
+    /// Returns `false` when admission or cell placement holds the pool, so
+    /// the caller retries rather than let the heap wait for the next reap.
+    ///
+    /// The guard is the one `reap` takes, for the same race: an admission
+    /// that snapshotted this slot before it began retiring can still
+    /// affiliate to it, and `may_free` only sees that request once the
+    /// admission has released the guard.
+    pub(crate) fn free_drained(&self) -> bool {
+        let Ok(_maintenance) = self.maintenance.try_write() else {
+            return false;
+        };
+        self.free_retired();
+        true
+    }
+
     /// Retire every empty isolate. Cell pools use this after eviction because
     /// an empty cell heap carries no warm request capacity worth preserving.
     pub fn reap_empty(&self) {
@@ -830,34 +913,6 @@ impl Pool {
         census
     }
 }
-
-/// Refused by policy, or the isolate could not be built. Distinct because the
-/// first is a 503 the caller may retry elsewhere and the second is a fault.
-#[derive(Debug)]
-pub enum AdmitError {
-    Refused(Refusal),
-    Build(anyhow::Error),
-}
-
-impl From<Refusal> for AdmitError {
-    fn from(refusal: Refusal) -> Self {
-        AdmitError::Refused(refusal)
-    }
-}
-
-impl std::fmt::Display for AdmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AdmitError::Refused(Refusal::NodeFull) => {
-                write!(f, "node is at its stateless request limit")
-            }
-            AdmitError::Refused(Refusal::NodePressured) => write!(f, "node is shedding load"),
-            AdmitError::Build(error) => write!(f, "isolate could not be started: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for AdmitError {}
 
 /// The property the whole design rests on: an isolate and everything hanging
 /// off it can be reached from any tokio worker. This is what `v8::Locker` and

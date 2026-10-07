@@ -162,6 +162,11 @@ unsafe fn x_read_inner(
             // Two faults of one run both fetch; the loser writes nothing.
             let run = match reader.read_run(pgno) {
                 Ok(run) => run,
+                // The fill can complete while this fetch is in flight, and
+                // then the owner's epoch GC may delete the objects the fetch
+                // reads. The page is in the local file by then; read it there
+                // instead of failing the query.
+                Err(_) if state.hydrated.lock().unwrap().contains(&pgno) => continue,
                 Err(_) => return ffi::SQLITE_IOERR_READ,
             };
             let mut hydrated = state.hydrated.lock().unwrap();

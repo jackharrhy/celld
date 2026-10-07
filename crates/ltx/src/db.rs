@@ -48,7 +48,7 @@
 
 use crate::error::{new_ltx_error, Error, Result};
 use crate::ltx::{self, lock_pgno, Crc64};
-use crate::wal::WalReader;
+use crate::wal::{WalError, WalReader};
 use crate::{
     ltx_file_path, ltx_level_dir, Pos, CHECKPOINT_MODE_PASSIVE, CHECKPOINT_MODE_RESTART,
     CHECKPOINT_MODE_TRUNCATE, META_DIR_SUFFIX, TXID, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE,
@@ -383,6 +383,13 @@ impl Db {
     /// Opens and initializes the database with litestream's WAL-mode setup and
     /// acquires the long-running read lock.
     ///
+    /// The host must complete this call successfully before opening any
+    /// other SQLite connection that can write to this database. After a
+    /// crash, an earlier write can hide a torn WAL header, so resumed capture
+    /// can skip new commits when existing LTX files retain the previous
+    /// capture position. An incomplete recovery checkpoint returns an error,
+    /// including when another connection keeps the checkpoint busy.
+    ///
     /// Ported from `DB.init` (db.go:795-911) — the connection-setup half plus the
     /// read-lock acquire and `ensureWALExists`.
     pub fn open(path: impl AsRef<Path>) -> Result<Db> {
@@ -390,12 +397,18 @@ impl Db {
     }
 
     /// Opens the database with an injected clock and executor host.
+    ///
+    /// This call must succeed before another writer opens the database.
+    /// See [`Db::open`] for the startup ordering requirement.
     pub fn open_with_host(path: impl AsRef<Path>, host: crate::LtxHost) -> Result<Db> {
         Self::open_with_host_and_optional_vfs(path, host, None)
     }
 
     /// Opens both managed connections through a named SQLite VFS. Used by the
     /// fault-injection VFS in tests and by paged restore's fault-in VFS.
+    ///
+    /// This call must succeed before another writer opens the database.
+    /// See [`Db::open`] for the startup ordering requirement.
     pub fn open_with_host_and_vfs(
         path: impl AsRef<Path>,
         host: crate::LtxHost,
@@ -451,8 +464,6 @@ impl Db {
             ));
         }
 
-        conn.execute_batch(CONTROL_TABLES_DDL).map_err(sql_err)?;
-
         // Dedicated read-lock connection (mirrors a second pooled connection).
         let rtx_conn = open(&path).map_err(sql_err)?;
         disable_lookaside(&rtx_conn)?;
@@ -493,6 +504,11 @@ impl Db {
             wal_file: None,
             max_l0_file_info: None,
         };
+
+        // Recover before any DDL can rewrite a torn header with reused salts,
+        // and before our long-lived reader can block the checkpoint.
+        db.recover_wal_header()?;
+        db.conn.execute_batch(CONTROL_TABLES_DDL).map_err(sql_err)?;
 
         // Start the long-running read transaction (db.go:867-871).
         db.acquire_read_lock()?;
@@ -674,10 +690,6 @@ impl Db {
         Ok(())
     }
 
-    /// Ensures the real WAL exists and has a header.
-    ///
-    /// Ported from `ensureWALExists` (db.go:1199-1209): exit early if the WAL
-    /// header is present; otherwise force a write to `_litestream_seq`.
     /// Runs `op` on the held WAL handle, opening it on first use. A WAL that
     /// SQLite recreated, or that a truncation shortened under a read, surfaces
     /// as `NotFound` or `UnexpectedEof`; the handle is dropped and `op` runs
@@ -726,6 +738,61 @@ impl Db {
         Ok(self.with_wal_file(|file| file.read_exact_at(offset as u64, n as usize))?)
     }
 
+    /// Resets a WAL with an invalid header checksum before initialization writes.
+    fn recover_wal_header(&mut self) -> Result<()> {
+        let header = match self.wal_header_bytes() {
+            Ok(header) => header,
+            // The later ensure_wal_exists call initializes missing or
+            // short WALs. Other I/O errors must remain visible to the caller.
+            Err(Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error),
+        };
+        match WalReader::new(&header) {
+            Ok(_) => return Ok(()),
+            Err(WalError::Eof) => {}
+            // SQLite rejects invalid magic before copying the salts or nCkpt.
+            // With nCkpt still zero, its next write chooses fresh salts, so
+            // verify detects the new generation without this checkpoint.
+            // Capture still rejects the invalid header until that write.
+            Err(WalError::InvalidMagic(_)) => return Ok(()),
+            // SQLite normally rejects an unsupported version while enabling
+            // WAL; keep any remaining header-reader errors visible.
+            Err(error) => return Err(error.into()),
+        }
+
+        // The host must open capture before other SQLite writers. After a
+        // crash, an earlier write can reuse salts and hide the torn header.
+        // SQLite rejects the torn WAL contents but retains the header's
+        // salts and checkpoint sequence. A bootstrap write alone can reuse
+        // those salts. The stale tail then lets an existing LTX cursor skip
+        // new commits. SQLite's TRUNCATE checkpoint changes the salts and
+        // removes that tail even if this process stops before its first
+        // capture. No volatile recovery flag can protect that gap.
+        // If control-table DDL is a no-op, ensure_wal_exists supplies the
+        // first write in the new generation.
+        // Only open checks the header, so live syncs keep their cheap check.
+        let checkpoint = self.run_checkpoint_pragma(CheckpointMode::Truncate)?;
+        if checkpoint.busy != 0 {
+            // A busy checkpoint leaves recovery incomplete, so opening must fail.
+            return Err(sql_err(rusqlite::Error::SqliteFailure(
+                ffi::Error::new(ffi::SQLITE_BUSY),
+                Some("torn WAL recovery checkpoint is busy".to_string()),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Ensures the real WAL exists and has a header.
+    ///
+    /// Ported from `ensureWALExists` (db.go:1199-1209): exit early if the WAL
+    /// header is present; otherwise force a write to `_litestream_seq`.
     fn ensure_wal_exists(&mut self) -> Result<()> {
         if self.wal_file_size()? >= WAL_HEADER_SIZE as i64 {
             return Ok(());

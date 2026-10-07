@@ -9,6 +9,24 @@
 use anyhow::{anyhow, bail};
 
 pub const DEFAULT_SHUTDOWN_TOTAL_MS: u64 = 40_000;
+
+/// Shared by deployment assembly, managed deployment validation and serving
+/// nodes. Operators must configure the same policy on all three paths.
+pub fn max_asset_file_bytes() -> anyhow::Result<u64> {
+    // A manifest can contain thousands of entries. Cache the policy so each
+    // entry neither allocates an environment string nor observes a new limit.
+    // Keep parse failures fallible for library callers that skip startup validation.
+    static LIMIT: std::sync::OnceLock<Result<u64, String>> = std::sync::OnceLock::new();
+    LIMIT
+        .get_or_init(|| {
+            positive_or("CELLD_MAX_ASSET_FILE_BYTES", 25 * 1024 * 1024)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .copied()
+        .map_err(|message| anyhow!("{message}"))
+}
+
 /// One process stop budget and the internal waits derived from it.
 /// The absolute deadline also bounds progress extensions, so neither wait
 /// grants time beyond the supervisor-facing process budget.
@@ -208,6 +226,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_LTX_COMPACTION_MIN_TXIDS",
         "CELLD_LTX_DURABILITY_TIMEOUT_SECS",
         "CELLD_MAX_CELL_REQUESTS",
+        "CELLD_MAX_ASSET_FILE_BYTES",
         "CELLD_MAX_OUTBOUND_WEBSOCKETS",
         "CELLD_MAX_REQUEST_BODY_BYTES",
         "CELLD_MAX_REQUESTS",
@@ -231,6 +250,7 @@ pub fn validate() -> anyhow::Result<()> {
         "CELLD_DEPLOY_MAX_AGE_S",
         "CELLD_LOCAL_CACHE_MAX_BYTES",
         "CELLD_LTX_TRUNCATE_PAGES",
+        "CELLD_LTX_RETENTION_SECS",
         "CELLD_LOG_HEDGE_MS",
         "CELLD_LOG_WINDOW",
         "CELLD_LOG_WINDOW_BYTES",
@@ -243,6 +263,8 @@ pub fn validate() -> anyhow::Result<()> {
     }
 
     shutdown_timing()?;
+
+    positive::<usize>("CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES")?;
 
     if let Some(value) = optional::<u64>("CELLD_PRESENCE_HEARTBEAT_MS")? {
         if !(50..=30_000).contains(&value) {

@@ -18,8 +18,9 @@ use crate::protocol::{
     asset_blob_key, AssetConfig, AssetEntry, AssetIndex, AssetManifestRef, DeployPointer, Manifest,
     ModuleKind, ModuleRef, QueueConsumerAttachment, QueueConsumerConfig, QueueConsumerDeployment,
     Rollout, RunWorkerFirst, FEATURE_ASSETS_V1, FEATURE_CONTAINERS_V1, FEATURE_CRON_V1,
-    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1, FEATURE_SQLITE_VEC_V1,
-    FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1, QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
+    FEATURE_D1_V1, FEATURE_KV_V1, FEATURE_PYTHON_WORKERS_V1, FEATURE_QUEUES_V1, FEATURE_R2_V1,
+    FEATURE_SQLITE_VEC_V1, FEATURE_WASM_V1, FEATURE_WORKFLOWS_V1,
+    QUEUE_CONSUMER_ATTACHMENT_SCHEMA_VERSION,
 };
 use anyhow::{anyhow, bail, Context};
 use flate2::write::GzEncoder;
@@ -33,6 +34,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+mod python;
 
 /// Config keys we understand. Anything else is an error: refusing is
 /// compat-safe, guessing produces confusing activation failures later.
@@ -181,7 +184,6 @@ pub fn operator_hint(class: &str) -> &'static str {
 
 const MAX_ASSET_FILES: usize = 20_000;
 const MAX_ASSET_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_ASSET_FILE_BYTES: u64 = 25 * 1024 * 1024;
 const MAX_ASSET_DIRECTIVE_BYTES: u64 = 100 * 1024;
 const ASSET_UPLOAD_CONCURRENCY: usize = 16;
 
@@ -200,13 +202,31 @@ pub struct Options {
     pub dry_run: bool,
     pub json: bool,
     /// Worker variables that override the `vars` of the config. `celld dev`
-    /// reads them from `.dev.vars`; `celld deploy` supplies none, so a local
-    /// credential cannot reach a fleet.
-    pub vars: BTreeMap<String, String>,
+    /// reads them from `.dev.vars` or the dotenv files; `celld deploy`
+    /// supplies none, so a local credential cannot reach a fleet.
+    pub vars: VarOverrides,
     /// Keep container images in the local engine instead of saving them to
     /// the bucket. `celld dev` runs its node on the same engine that built
     /// them; a fleet needs the tar.
     pub local_images: bool,
+}
+
+/// Local Worker variables, tagged with the kind of file that supplied them.
+/// The kind decides what an entry that cannot become a var binding does, so
+/// it travels with the entries instead of beside them.
+#[derive(Default)]
+pub enum VarOverrides {
+    #[default]
+    None,
+    /// `.dev.vars` exists only for the Worker, so an entry that cannot become
+    /// a binding is a mistake, and it fails the build.
+    DevVars(BTreeMap<String, String>),
+    /// `.env` and `.env.local` also serve other tools, such as a bundler or an
+    /// ORM. An entry with a name that is not a valid binding, or a name that
+    /// another binding of the config uses, is skipped with a warning. Failing
+    /// instead stops a `celld dev` that `wrangler dev` runs, and the only
+    /// workaround is an empty `.dev.vars`.
+    DotEnv(BTreeMap<String, String>),
 }
 
 pub fn print_help() {
@@ -242,7 +262,7 @@ pub fn options_from_arguments(
         dry_run: false,
         local_images: false,
         json: false,
-        vars: BTreeMap::new(),
+        vars: VarOverrides::None,
     };
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -299,6 +319,9 @@ struct Project {
     has_queues: bool,
     has_r2: bool,
     containers: Vec<ContainerDecl>,
+    /// Set when `main` is a `.py` file: the Python behavior its
+    /// compatibility date and flags select.
+    python: Option<python::PythonCompat>,
 }
 
 /// The two Wrangler bundling knobs that celld forwards to esbuild.
@@ -600,7 +623,11 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .entry
         .as_deref()
         .map(|entry| {
-            if project.no_bundle {
+            if let Some(compat) = &project.python {
+                let (output, descriptor) = python::build(&root, entry, compat)?;
+                project.metadata["python_runtime"] = descriptor;
+                Ok(output)
+            } else if project.no_bundle {
                 // Already bundled by the caller's toolchain. Read it as it is;
                 // running esbuild over a Vite build is what corrupts it.
                 let path = root.join(entry);
@@ -652,6 +679,7 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
         .and_then(Value::as_array)
         .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some("sqlite_vec")));
     let uses_d1 = project.do_classes.iter().any(|class| class == D1_CLASS);
+    let python_runtime = project.python.is_some();
     let manifest = Manifest {
         schema_version: if asset_reference.is_some() { 2 } else { 1 },
         version: version.clone(),
@@ -707,6 +735,9 @@ pub fn build(options: &Options) -> anyhow::Result<Built> {
             }
             if !wasm_names.is_empty() {
                 features.push(FEATURE_WASM_V1.to_string());
+            }
+            if python_runtime {
+                features.push(FEATURE_PYTHON_WORKERS_V1.to_string());
             }
             features
         },
@@ -1253,11 +1284,7 @@ pub(crate) fn resolve_config(given: Option<PathBuf>) -> anyhow::Result<PathBuf> 
     )
 }
 
-fn read_project(
-    path: &Path,
-    root: &Path,
-    overrides: &BTreeMap<String, String>,
-) -> anyhow::Result<Project> {
+fn read_project(path: &Path, root: &Path, overrides: &VarOverrides) -> anyhow::Result<Project> {
     let source =
         std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let config: Value = serde_json::from_str(&strip_jsonc(&source))
@@ -1315,6 +1342,14 @@ fn read_project(
     if no_bundle && main.is_none() {
         bail!("config sets `no_bundle` without `main`");
     }
+    let python = main
+        .as_deref()
+        .filter(|main| main.ends_with(".py"))
+        .map(|_| {
+            python::check_supported_events(object)?;
+            python::python_compat(object)
+        })
+        .transpose()?;
     let bundle = read_bundle_config(object)?;
     // `define` and `rules` describe the esbuild run, and `no_bundle` is the
     // absence of one. Accepting both would produce a deployment that silently
@@ -1854,15 +1889,40 @@ fn read_project(
         Some(_) => bail!("config `vars` must be an object"),
     }
     // An asset-only project has no Worker to hand a variable to, so a
-    // `.dev.vars` beside it is residue, not a binding the guard below
+    // `.dev.vars` or `.env` beside it is residue, not a binding the guard below
     // should refuse in the config's name.
     let declared_vars = !vars.is_empty();
     if main.is_some() {
-        vars.extend(
-            overrides
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_str())),
-        );
+        match overrides {
+            VarOverrides::None => {}
+            VarOverrides::DevVars(entries) => vars.extend(
+                entries
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            ),
+            VarOverrides::DotEnv(entries) => {
+                // A config var of the same name is the override the entry
+                // exists for; every other binding owns its name.
+                let taken = bindings
+                    .iter()
+                    .filter_map(|binding| binding.get("name").and_then(Value::as_str))
+                    .chain(
+                        assets
+                            .as_ref()
+                            .and_then(|assets| assets.config.binding.as_deref()),
+                    )
+                    .collect::<BTreeSet<_>>();
+                for (name, value) in entries {
+                    if !valid_binding(name) {
+                        note!("warning: skipped the dotenv entry {name:?}, which is not a valid binding name");
+                    } else if taken.contains(name.as_str()) {
+                        note!("warning: skipped the dotenv entry {name:?}, whose name another binding uses");
+                    } else {
+                        vars.insert(name, value);
+                    }
+                }
+            }
+        }
     }
     for (name, value) in &vars {
         if !valid_binding(name) {
@@ -1951,6 +2011,7 @@ fn read_project(
         queue_consumers,
         has_r2: !r2_buckets.is_empty(),
         containers,
+        python,
     })
 }
 
@@ -2545,7 +2606,7 @@ fn validate_worker_first(value: &RunWorkerFirst) -> anyhow::Result<()> {
     let mut positive = false;
     let mut seen = std::collections::HashSet::new();
     for route in routes {
-        if route.len() <= 1
+        if route.is_empty()
             || route.len() > 100
             || route.contains(['\\', '\0'])
             || (!route.starts_with('/') && !route.starts_with("!/"))
@@ -2583,6 +2644,7 @@ fn read_asset_directive(directory: &Path, name: &str) -> anyhow::Result<Option<S
 }
 
 fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
+    let max_file_bytes = crate::env_vars::max_asset_file_bytes()?;
     let mut files = Vec::new();
     collect_asset_files(&project.directory, "", &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2596,9 +2658,8 @@ fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
     for (relative, path) in files {
         let metadata =
             std::fs::metadata(&path).with_context(|| format!("inspect {}", path.display()))?;
-        if metadata.len() > MAX_ASSET_FILE_BYTES {
-            bail!("asset /{relative} exceeds the 25 MiB file limit");
-        }
+        let asset_path = format!("/{relative}");
+        crate::assets::validate_asset_file_size(&asset_path, metadata.len(), max_file_bytes)?;
         total_bytes = total_bytes
             .checked_add(metadata.len())
             .context("asset byte count overflow")?;
@@ -2612,7 +2673,7 @@ fn build_assets(project: &ProjectAssets) -> anyhow::Result<BuiltAssets> {
         let sha256 = format!("{:x}", Sha256::digest(&body));
         blobs.entry(sha256.clone()).or_insert(body);
         entries.insert(
-            format!("/{relative}"),
+            asset_path,
             AssetEntry {
                 sha256,
                 bytes: metadata.len(),

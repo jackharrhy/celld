@@ -283,6 +283,7 @@ USAGE:
   celld deploy [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld dev [PROJECT] [--host IP] [--port PORT] [--logs]
   celld cell list [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
+  celld cell gc --dry-run [CLASS] --bucket [s3://|gs://|az://]NAME[/PREFIX] [OPTIONS]
   celld d1 migrations apply DATABASE [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld d1 execute DATABASE --command SQL [PROJECT] --bucket [s3://|gs://|az://]NAME[/PREFIX]
   celld kv get|put|delete|list|info NAMESPACE --bucket [s3://|gs://|az://]NAME[/PREFIX]
@@ -372,6 +373,8 @@ TUNING:
   CELLD_MAX_RESIDENT_CELLS        Resident-cell hard cap, enforced at admission
   CELLD_MAX_CELL_REQUESTS         Concurrent fetches per cell (default: 64)
   CELLD_MAX_REQUEST_BODY_BYTES    Ingress request body limit (default: 1 GiB)
+  CELLD_MAX_ASSET_FILE_BYTES      Per-file asset limit (default: 25 MiB)
+  CELLD_MAX_DYNAMIC_WORKER_CODE_BYTES  Loaded module total (default: 64 MiB)
   CELLD_PRESSURE_OWNERSHIP        release to rebalance, sticky to cache locally
   CELLD_MAX_RSS_MB                Active-memory shed threshold (default: 80%; 0 disables)
   CELLD_ALARM_RESIDENT_MS         Near-alarm residency window
@@ -389,6 +392,7 @@ TUNING:
   CELLD_LOG_PIPELINE              Fleet log rounds in flight (default: 4)
   CELLD_LOG_HEDGE_MS              Duplicate a slow log append (default: adaptive; 0 disables)
   CELLD_LTX_TRUNCATE_PAGES        WAL pages before a truncate checkpoint (default: 128; Queues never truncate; 0 disables)
+  CELLD_LTX_RETENTION_SECS        Grace in seconds before an owner deletes superseded epochs (default: unset, no deletion)
   RUST_LOG                        Runtime log filter (default: info)
 
 Documentation: https://celld.dev/docs"#,

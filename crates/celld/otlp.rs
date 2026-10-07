@@ -177,13 +177,14 @@ pub fn traces_request(spans: &[Span], node: &str, region: &str, service: &str) -
     out
 }
 
-/// logs.v1.LogRecord: time=1, severity_number=2, body=5, trace_id=9,
-/// span_id=10, observed_time=11.
+/// logs.v1.LogRecord: time=1, severity_number=2, severity_text=3, body=5,
+/// trace_id=9, span_id=10, observed_time=11.
 fn log_message(log: &Log) -> Vec<u8> {
     let mut out = Vec::new();
     let time_ns = log.time_unix_us.max(0) as u64 * 1_000;
     field_fixed64(&mut out, 1, time_ns);
-    field_varint(&mut out, 2, 9); // SEVERITY_NUMBER_INFO
+    field_varint(&mut out, 2, log.severity.number() as u64);
+    field_str(&mut out, 3, log.severity.text());
     field_bytes(&mut out, 5, &any_string(&log.body));
     if let Some(trace_id) = log.trace_id {
         field_bytes(&mut out, 9, &trace_id);

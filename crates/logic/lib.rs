@@ -15,6 +15,7 @@ pub mod cron;
 pub mod dead_node_reconciliation;
 pub mod drain;
 pub mod durability;
+pub mod epoch_gc;
 pub mod format;
 pub mod gate;
 pub mod http;
@@ -682,6 +683,13 @@ pub struct State {
     /// resident cell — the product wedged cold-cell activation, the rate
     /// falling with the cell count (engine/pathological-load.md).
     active_cells: BTreeMap<CellId, usize>,
+    /// The active requests that `gate_request` admitted past a quiescing
+    /// cell, and how many each cell holds. A gate cannot admit the next gate:
+    /// counted as the work that raises gates, a background chain of
+    /// overlapping gates admitted its own successor after every handler had
+    /// ended, so the cell never reached its swap safe point.
+    admitted_gates: BTreeSet<RequestId>,
+    admitted_gate_cells: BTreeMap<CellId, usize>,
     /// Local write responses withheld by the output gate until their cell is
     /// proven durable to the written position, keyed by the durability op. An
     /// open gate makes its cell active, so the cell cannot be evicted
@@ -855,6 +863,8 @@ impl State {
             request_cells: BTreeMap::new(),
             active_requests: BTreeMap::new(),
             active_cells: BTreeMap::new(),
+            admitted_gates: BTreeSet::new(),
+            admitted_gate_cells: BTreeMap::new(),
             barriers: BTreeMap::new(),
             gate_pinned: BTreeSet::new(),
             worker_cursor: None,
@@ -1004,7 +1014,9 @@ impl State {
     }
 
     /// Whether the last load sample reserves memory below every pressure
-    /// resume line. False before the first sample.
+    /// resume line. False until the first `LoadSampled` event. The actor must
+    /// fold a sample before it publishes a lease, or the lease reports no
+    /// headroom.
     pub fn memory_headroom(&self) -> bool {
         self.memory_headroom
     }
@@ -1600,6 +1612,19 @@ impl State {
                 self.active_cells, recount
             ));
         }
+        let mut gate_recount: BTreeMap<CellId, usize> = BTreeMap::new();
+        for request in &self.admitted_gates {
+            let Some(id) = self.active_requests.get(request) else {
+                return Err(format!("admitted gate {request} is not active"));
+            };
+            *gate_recount.entry(id.clone()).or_insert(0) += 1;
+        }
+        if gate_recount != self.admitted_gate_cells {
+            return Err(format!(
+                "admitted_gate_cells index {:?} disagrees with admitted_gates {:?}",
+                self.admitted_gate_cells, gate_recount
+            ));
+        }
         for (request, id) in &self.active_requests {
             if self.request_cells.contains_key(request) {
                 return Err(format!("request {request} is both pending and active"));
@@ -1744,7 +1769,22 @@ impl State {
                 self.active_cells.remove(&cell);
             }
         }
+        if self.admitted_gates.remove(&request) {
+            if let Some(count) = self.admitted_gate_cells.get_mut(&cell) {
+                *count -= 1;
+                if *count == 0 {
+                    self.admitted_gate_cells.remove(&cell);
+                }
+            }
+        }
         Some(cell)
+    }
+
+    /// Whether `id` runs active work other than an admitted gate.
+    fn runs_gate_source(&self, id: &str) -> bool {
+        let active = self.active_cells.get(id).copied().unwrap_or(0);
+        let gates = self.admitted_gate_cells.get(id).copied().unwrap_or(0);
+        active > gates
     }
 
     /// Hibernated (Durable Objects state 4): out of memory, still on this
@@ -3536,6 +3576,44 @@ impl State {
         } else {
             // A hibernatable socket can outlive residency. It follows the
             // ordinary route so it can reactivate here or reach a successor.
+            self.request(request, id, false, false, effects);
+        }
+    }
+
+    /// Admit an output gate on a resident cell even while it quiesces.
+    ///
+    /// A swap quiesces a cell so new traffic queues for the restarted runtime,
+    /// and it waits for admitted work to finish. A gate is part of that work:
+    /// the handler holding the effect cannot finish until the gate answers.
+    /// Queued like new traffic, the gate waited for the swap, the swap waited
+    /// for the handler, and only the swap's maximum age broke the cycle by
+    /// cancelling the handler (denoland/celld#255). The ticket's epoch check
+    /// still refuses a gate whose write a restart discarded.
+    ///
+    /// The cell must have the work that raised the gate: an active request
+    /// that is not itself an admitted gate, or a firing alarm. Otherwise the
+    /// gate takes the ordinary route. A drain cancels the cell's work instead
+    /// of waiting for it, so it has no cycle to break.
+    ///
+    /// A forced swap admits no further gate. It cancels the cell's activity
+    /// once, from a snapshot of the active requests, so a gate admitted after
+    /// that snapshot is work nothing cancels, and the swap's maximum age would
+    /// no longer bound it. The cancelled handler fails anyway, so its queued
+    /// gate costs nothing.
+    fn gate_request(&mut self, request: RequestId, id: CellId, effects: &mut Vec<Effect>) {
+        let admitted = self.node_authoritative()
+            && !self.draining
+            && self.cells.get(&id).is_some_and(|cell| {
+                matches!(cell.phase, Phase::Resident { .. })
+                    && !cell.swap_cancelled
+                    && (self.runs_gate_source(&id)
+                        || matches!(cell.alarm, Some(AlarmState::Firing { .. })))
+            });
+        if admitted {
+            self.complete_request(&id, request, Ok(Route::Local), effects);
+            self.admitted_gates.insert(request);
+            *self.admitted_gate_cells.entry(id).or_insert(0) += 1;
+        } else {
             self.request(request, id, false, false, effects);
         }
     }
@@ -6495,6 +6573,8 @@ impl State {
         self.adopting_cells.clear();
         self.active_requests.clear();
         self.active_cells.clear();
+        self.admitted_gates.clear();
+        self.admitted_gate_cells.clear();
         // Any write still waiting on the output gate loses its cell here, so it
         // must fail rather than be acknowledged — the fence and the fail are
         // atomic. A late DurableReached for a drained op is ignored.
@@ -6630,6 +6710,7 @@ fn event_mono_ms(event: &Event) -> Option<u64> {
         | Event::CapacityRequestAt { now_mono_ms, .. }
         | Event::HandoffRequestAt { now_mono_ms, .. }
         | Event::WebSocketRequestAt { now_mono_ms, .. }
+        | Event::GateRequestAt { now_mono_ms, .. }
         | Event::OutputAt { now_mono_ms, .. }
         | Event::WakeHintAt { now_mono_ms, .. }
         | Event::TimerFired { now_mono_ms, .. }
@@ -6715,6 +6796,9 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
             websocket,
             ..
         } => state.websocket_request(request, cell, websocket, &mut effects),
+        Event::GateRequestAt { request, cell, .. } => {
+            state.gate_request(request, cell, &mut effects)
+        }
         Event::WorkerRequest { request } => state.worker_request(request, &mut effects),
         Event::BeginPreserve => state.begin_preserve(&mut effects),
         Event::Cancel { request } => state.cancel(request, &mut effects),

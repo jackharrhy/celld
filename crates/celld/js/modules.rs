@@ -114,6 +114,10 @@ pub(super) fn compile_module<'s>(
 #[derive(Default)]
 pub(super) struct ModuleRegistry {
     modules: Mutex<HashMap<String, v8::Global<v8::Module>>>,
+    /// Canonical names for source modules. V8 passes only the referrer module
+    /// to the static resolve callback, so the registry must retain the name
+    /// that relative imports use as their base.
+    source_names: Mutex<Vec<(v8::Global<v8::Module>, String)>>,
     /// The host-generated stubs: the only modules whose `celld:internals`
     /// import resolves. A user module that names the specifier is refused
     /// by [`resolve_external`], so the internals object stays out of reach
@@ -132,15 +136,35 @@ impl ModuleRegistry {
         specs: impl IntoIterator<Item = String>,
         module: v8::Local<v8::Module>,
         trusted: bool,
+        source_name: Option<&str>,
     ) {
         let global = v8::Global::new(scope, module);
         if trusted {
             self.trusted.lock().unwrap().push(global.clone());
         }
+        if let Some(source_name) = source_name {
+            self.source_names
+                .lock()
+                .unwrap()
+                .push((global.clone(), source_name.to_string()));
+        }
         let mut modules = self.modules.lock().unwrap();
         for spec in specs {
             modules.insert(spec, global.clone());
         }
+    }
+
+    fn source_name(
+        &self,
+        scope: &mut v8::PinScope,
+        module: v8::Local<v8::Module>,
+    ) -> Option<String> {
+        self.source_names
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(registered, _)| v8::Local::new(scope, registered) == module)
+            .map(|(_, name)| name.clone())
     }
 
     fn trusts(&self, scope: &mut v8::PinScope, module: v8::Local<v8::Module>) -> bool {
@@ -156,6 +180,10 @@ impl ModuleRegistry {
 /// builtin: `is_external` does not know it, so a dynamic import() of it
 /// rejects, and a static import from a user module fails to link.
 const INTERNALS_SPECIFIER: &str = "celld:internals";
+
+/// The host module of the Python Worker bundle that `celld deploy` builds.
+/// Its one export condemns the calling isolate; see `op_isolate_condemn`.
+const PYTHON_HOST_SPECIFIER: &str = "celld:python";
 
 /// One synthetic module per isolate whose default export is the internals
 /// object, built the first time a stub links.
@@ -196,7 +224,7 @@ fn register_internal_stub(scope: &mut v8::PinScope, spec: &str, source: &str) {
         tracing::warn!(%spec, "module stub failed to compile");
         return;
     };
-    modreg(scope).register(scope, [spec.to_string()], module, true);
+    modreg(scope).register(scope, [spec.to_string()], module, true, None);
 }
 
 fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
@@ -206,11 +234,12 @@ fn modreg(scope: &mut v8::PinScope) -> Arc<ModuleRegistry> {
         .expect("isolate has no module registry")
 }
 
-/// Is `spec` an external builtin (`node:*`, `cloudflare:*`, or a bare node
-/// builtin)? esbuild bundles every npm dep inline and leaves only builtins
-/// external, so a remaining bare specifier is a node builtin.
+/// Is `spec` an external builtin (`node:*`, `cloudflare:*`, `celld:python`,
+/// or a bare node builtin)? esbuild bundles every npm dep inline and leaves
+/// only builtins external, so a remaining bare specifier is a node builtin.
 fn is_external(spec: &str) -> bool {
-    if spec.starts_with("node:") || spec.starts_with("cloudflare:") {
+    if spec.starts_with("node:") || spec.starts_with("cloudflare:") || spec == PYTHON_HOST_SPECIFIER
+    {
         return true;
     }
     // bare builtin, or a builtin submodule like `stream/promises`
@@ -543,6 +572,7 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
     // subclass would make `throw new NonRetryableError(...)` throw a value
     // the retry policy cannot recognize — the step would retry, silently.
     let cf_workflows = spec == "cloudflare:workflows";
+    let python_host = spec == PYTHON_HOST_SPECIFIER;
     let lazy = LAZY_MODULES.iter().find(|m| m.specs.contains(&spec));
     let eager = eager_module_global(spec);
     let base = if cf {
@@ -551,6 +581,8 @@ fn stub_source(spec: &str, names: &std::collections::BTreeSet<String>) -> String
         "__celld.__cfSockets".to_string()
     } else if cf_workflows {
         "__celld.__cfWorkflows".to_string()
+    } else if python_host {
+        "__celld.__pythonHost".to_string()
     } else if let Some(m) = lazy {
         format!("__celld.{}", m.global)
     } else if let Some(global) = eager {
@@ -611,7 +643,7 @@ pub(super) fn register_stubs(scope: &mut v8::PinScope, config: &WorkerConfig) {
             serde_json::to_string(content).unwrap()
         );
         match compile_module(scope, spec, &s) {
-            Some(m) => modreg(scope).register(scope, [spec.clone()], m, false),
+            Some(m) => modreg(scope).register(scope, [spec.clone()], m, false, None),
             None => tracing::warn!(%spec, "text module failed to compile"),
         }
     }
@@ -629,12 +661,21 @@ fn register_sibling_module(scope: &mut v8::PinScope, name: &str, source: &str, t
         tracing::warn!(%name, "sibling module failed to compile");
         return;
     };
+    register_named_module(scope, name, m, trusted);
+}
+
+fn register_named_module(
+    scope: &mut v8::PinScope,
+    name: &str,
+    module: v8::Local<v8::Module>,
+    trusted: bool,
+) {
     // The dynamic key makes the same module available to import() without
     // making a narrow static builtin stub look like a full namespace.
     let specs = [name.to_string(), format!("./{name}")]
         .into_iter()
         .flat_map(|spec| [format!("dyn:{spec}"), spec]);
-    modreg(scope).register(scope, specs, m, trusted);
+    modreg(scope).register(scope, specs, module, trusted, Some(name));
 }
 
 /// Compiled-wasm modules shared process-wide: the first isolate to see a blob
@@ -775,7 +816,11 @@ pub(super) fn register_wasm_modules(scope: &mut v8::PinScope, modules: &[(String
 /// both bare and relative sibling imports resolve; the whole graph links when
 /// the main module instantiates. Any builtin a sibling imports (and the main
 /// module did not) is stubbed too.
-pub(super) fn register_loader_modules(scope: &mut v8::PinScope, config: &WorkerConfig) {
+pub(super) fn register_loader_modules(
+    scope: &mut v8::PinScope,
+    config: &WorkerConfig,
+    main: v8::Local<v8::Module>,
+) {
     for (_name, _source, imports) in config.es_modules() {
         for (spec, names) in imports {
             if modreg(scope).modules.lock().unwrap().contains_key(spec) {
@@ -790,6 +835,7 @@ pub(super) fn register_loader_modules(scope: &mut v8::PinScope, config: &WorkerC
             register_internal_stub(scope, spec, &s);
         }
     }
+    register_named_module(scope, &config.main_module_name, main, false);
     for (name, source, _imports) in config.es_modules() {
         register_sibling_module(scope, name, source, false);
     }
@@ -818,16 +864,49 @@ pub(super) fn resolve_external<'s>(
         scope.throw_exception(exception);
         return None;
     }
+    let resolved = registry
+        .source_name(scope, referrer)
+        .and_then(|referrer| resolve_relative_specifier(&referrer, &spec));
+    let key = resolved.as_deref().unwrap_or(&spec);
     let m = registry
         .modules
         .lock()
         .unwrap()
-        .get(&spec)
+        .get(key)
         .map(|module| v8::Local::new(scope, module));
     if m.is_none() {
-        tracing::warn!(%spec, "resolve: no stub for specifier");
+        tracing::warn!(%spec, resolved = key, "resolve: no stub for specifier");
     }
     m
+}
+
+/// Resolve a relative module specifier against the importing module's name.
+/// Module names use URL-style `/` separators even on Windows, so filesystem
+/// path utilities would give platform-dependent answers here.
+fn resolve_relative_specifier(referrer: &str, spec: &str) -> Option<String> {
+    if !spec.starts_with("./") && !spec.starts_with("../") {
+        return None;
+    }
+    let absolute = referrer.starts_with('/');
+    let mut segments: Vec<&str> = referrer
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for segment in spec.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." if segments.last().is_some_and(|segment| *segment != "..") => {
+                segments.pop();
+            }
+            ".." if !absolute => segments.push(segment),
+            ".." => {}
+            _ => segments.push(segment),
+        }
+    }
+    let path = segments.join("/");
+    Some(if absolute { format!("/{path}") } else { path })
 }
 
 /// The backing-object expression for a builtin specifier, or `None` if `spec`
@@ -841,6 +920,9 @@ fn builtin_source(scope: &mut v8::PinScope, spec: &str) -> Option<String> {
     }
     if spec == "cloudflare:workflows" {
         return Some("__celld.__cfWorkflows".into());
+    }
+    if spec == PYTHON_HOST_SPECIFIER {
+        return Some("__celld.__pythonHost".into());
     }
     if let Some(module) = install_lazy_module(scope, spec) {
         return Some(format!("__celld.{}", module.global));
@@ -897,7 +979,7 @@ pub(super) fn op_builtin_module(
     mut rv: v8::ReturnValue<v8::Value>,
 ) {
     let spec = args.get(0).to_rust_string_lossy(scope);
-    if spec.starts_with("cloudflare:") {
+    if spec.starts_with("cloudflare:") || spec == PYTHON_HOST_SPECIFIER {
         return; // not a node builtin
     }
     let Some(expr) = builtin_source(scope, &spec) else {
@@ -929,7 +1011,7 @@ fn dynamic_module<'s>(
                 .ok_or_else(|| anyhow!("dynamic import of \"{spec}\" is not supported"))?;
             let module = compile_module(scope, spec, &src)
                 .ok_or_else(|| anyhow!("dynamic module for {spec} did not compile"))?;
-            modreg(scope).register(scope, [key], module, true);
+            modreg(scope).register(scope, [key], module, true, None);
             module
         }
     };
@@ -979,16 +1061,19 @@ fn evaluate_dynamic_module<'s>(
 pub(super) fn host_import_module_dynamically<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     let spec = specifier.to_rust_string_lossy(scope);
+    let referrer = resource_name.to_rust_string_lossy(scope);
+    let resolved = resolve_relative_specifier(&referrer, &spec);
+    let spec = resolved.as_deref().unwrap_or(&spec);
     let tc = std::pin::pin!(v8::TryCatch::new(scope));
     let tc = &mut tc.init();
-    match evaluate_dynamic_module(tc, &spec) {
+    match evaluate_dynamic_module(tc, spec) {
         Ok(import) => return Some(import),
         Err(error) => {
             let caught = tc.exception();

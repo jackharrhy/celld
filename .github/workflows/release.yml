@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUST_VERSION: 1.97.1
+  RUST_VERSION: 1.98.1
   IMAGE: ghcr.io/denoland/celld
 
 jobs:
@@ -126,12 +126,14 @@ jobs:
           path: assets
           merge-multiple: true
 
-      # Assets are minimal: the binaries, nothing else. Integrity is the
-      # attestation plus GitHub's own immutable per-asset digests; gzip's
-      # CRC catches corruption in transit.
+      # Assets are minimal: the binaries plus LICENSE and NOTICE, which
+      # the third-party licenses require to travel with them. Integrity is
+      # the attestation plus GitHub's own immutable per-asset digests;
+      # gzip's CRC catches corruption in transit.
       - name: Check assets
         run: |
           set -euo pipefail
+          cp LICENSE NOTICE assets/
           cd assets
           for target in \
             x86_64-unknown-linux-gnu \

@@ -600,6 +600,15 @@ pub enum Event {
         now_ms: u64,
         now_mono_ms: u64,
     },
+    /// The output gate for an effect that work already running on this cell
+    /// raised. Only the cell's own isolate raises one, so it belongs to
+    /// admitted work and must not queue behind a swap that waits for that
+    /// same work to finish.
+    GateRequestAt {
+        request: RequestId,
+        cell: CellId,
+        now_mono_ms: u64,
+    },
     /// Reserve an idle resident isolate for a top-level Worker request. The
     /// shell falls back to the stateless pool when no resident is available;
     /// choosing and pinning a resident is lifecycle policy and therefore

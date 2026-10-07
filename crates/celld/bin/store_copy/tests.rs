@@ -79,6 +79,7 @@ fn opts(source: &str, destination: &str, manifest: &std::path::Path, resume: boo
 async fn local_copy_resume_and_mismatch_refusal() -> Result<()> {
     // The production facade retains one process-wide Tokio domain. Keep the
     // default cases on one runtime instead of dropping its first runtime early.
+    celld::asyncrt::set_host_handle(tokio::runtime::Handle::current());
     let temp = tempfile::tempdir()?;
     let source = format!("sqlite://{}", temp.path().join("source.sqlite3").display());
     let destination = format!(

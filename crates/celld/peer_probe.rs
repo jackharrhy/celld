@@ -223,7 +223,7 @@ fn decode_hex<const N: usize>(encoded: &str) -> anyhow::Result<[u8; N]> {
         return Err(anyhow!("incorrect hexadecimal length"));
     }
     let mut decoded = [0_u8; N];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in encoded.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         decoded[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Ok(decoded)

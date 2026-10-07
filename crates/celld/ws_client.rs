@@ -51,7 +51,7 @@ pub enum Error {
     /// The server answered and refused the upgrade. Callers read this: a 401
     /// revokes managed credentials, a stale-route header triggers a
     /// redispatch, and the isolate surfaces the whole thing to `onerror`.
-    Declined(Declined),
+    Declined(Box<Declined>),
     /// No answer to read -- DNS, TCP, TLS, or a malformed handshake.
     Failed(anyhow::Error),
 }
@@ -183,11 +183,11 @@ pub async fn connect(url: &str, extra: HeaderMap) -> Result<Connection, Error> {
             .await
             .map(|body| body.to_bytes().to_vec())
             .unwrap_or_default();
-        return Err(Error::Declined(Declined {
+        return Err(Error::Declined(Box::new(Declined {
             status,
             headers,
             body,
-        }));
+        })));
     }
     if response
         .headers()

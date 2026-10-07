@@ -29,6 +29,8 @@ supports, one service or API at a time:
   in a container per sandbox; needs `npm install` and a Docker or Podman CLI
 - `pi/` — the PiHarness agent loop in a Durable Object
 - `opencode/` — the OpenCode Workerd SDK in a Durable Object
+- `python/` — a Python Worker that summarizes HTML with a vendored package;
+  needs `uv run pywrangler sync` first (see [Python Workers](../docs/services/workers.md#python-workers))
 - `wasm/` — a Durable Object counter in Rust, compiled to Wasm with
   [workers-rs](https://github.com/cloudflare/workers-rs); needs a build step
   first (see its [README](wasm/README.md))

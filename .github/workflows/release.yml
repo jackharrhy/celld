@@ -20,12 +20,11 @@ on:
     types: [published]
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: release-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   RUST_VERSION: 1.98.1
@@ -47,8 +46,12 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build
         run: |
@@ -68,7 +71,7 @@ jobs:
           gzip -9 -n -c target/release/celld \
             > "out/celld-${{ matrix.target }}.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: celld-${{ matrix.target }}
           path: out/celld-${{ matrix.target }}.gz
@@ -85,9 +88,11 @@ jobs:
       contents: read
       packages: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         env:
@@ -119,9 +124,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: assets
           merge-multiple: true
@@ -146,7 +153,7 @@ jobs:
       # skip this step and retain the release asset digests.
       - name: Attest build provenance
         if: github.event.repository.visibility == 'public'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: assets/*.gz
 
@@ -208,21 +215,26 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event.release.tag_name }}
 
       - name: Resolve and validate the release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
-          test "${{ github.event.release.tag_name }}" = "v$version"
+          test "$RELEASE_TAG" = "v$version"
           echo "TAG_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "CELLD_VERSION=$version" >> "$GITHUB_ENV"
 
       # Registry cache export (--cache-to type=registry) needs the
       # docker-container driver; the default docker driver cannot export.
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          cache-binary: false
 
       - name: Log in to GHCR
         env:
@@ -240,7 +252,6 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --build-arg "CELLD_COMMIT=$TAG_SHA" \
             --build-arg "CELLD_VERSION=$CELLD_VERSION" \
-            --cache-from "type=registry,ref=$cache" \
             --cache-to "type=registry,ref=$cache,mode=max" \
             --provenance=mode=max \
             --sbom=true \
@@ -260,15 +271,18 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event.release.tag_name }}
 
       - name: Resolve and validate the release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/celld/Cargo.toml | head -1)
-          test "${{ github.event.release.tag_name }}" = "v$version"
+          test "$RELEASE_TAG" = "v$version"
           echo "TAG_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "CELLD_VERSION=$version" >> "$GITHUB_ENV"
 
@@ -280,11 +294,13 @@ jobs:
             docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
 
       - name: Publish immutable and release tags
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
           docker buildx imagetools create \
             --tag "$IMAGE:sha-$TAG_SHA" \
-            --tag "$IMAGE:${{ github.event.release.tag_name }}" \
+            --tag "$IMAGE:$RELEASE_TAG" \
             --tag "$IMAGE:$CELLD_VERSION" \
             --tag "$IMAGE:latest" \
             "$IMAGE:$TAG_SHA-amd64" \
@@ -301,7 +317,7 @@ jobs:
       # Attestations require a public repository.
       - name: Attest image provenance
         if: github.event.repository.visibility == 'public'
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/denoland/celld
           subject-digest: ${{ steps.digest.outputs.digest }}

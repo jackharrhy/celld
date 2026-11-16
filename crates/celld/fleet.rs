@@ -15,6 +15,7 @@ use crate::ownership_store::NodeLeaseWire;
 use crate::protocol::{DeployPointer, Manifest, ModuleKind, Rollout};
 use anyhow::{bail, Context};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 use crate::cli_output::Format;
 use crate::cli_output::Output;
@@ -897,7 +898,7 @@ async fn load_worker_at_pointer(
         .filter_map(|binding| binding.get("name")?.as_str().map(str::to_string))
         .collect();
     let services = service_bindings(&manifest);
-    let vars = worker_vars(&manifest);
+    let vars = worker_vars(&manifest)?;
     let compat = crate::worker_compat(&manifest.raw_metadata);
     let assets = match &manifest.assets {
         Some(reference) => Some(
@@ -1011,13 +1012,92 @@ fn service_bindings(manifest: &Manifest) -> Vec<(String, String, Option<String>)
         .collect()
 }
 
-fn worker_vars(manifest: &Manifest) -> Vec<(String, String)> {
-    bindings(manifest, "plain_text")
-        .filter_map(|binding| {
-            Some((
-                binding.get("name")?.as_str()?.to_string(),
-                binding.get("text")?.as_str()?.to_string(),
-            ))
+fn worker_vars(manifest: &Manifest) -> anyhow::Result<Vec<(String, String)>> {
+    let file = std::env::var("CELLD_VARS_FILE").ok();
+    let overrides: Vec<_> = std::env::vars()
+        .filter_map(|(name, value)| {
+            name.strip_prefix("CELLD_VAR_")
+                .filter(|name| !name.is_empty())
+                .map(|name| (name.to_owned(), value))
         })
-        .collect()
+        .collect();
+    let contents = file
+        .map(|path| {
+            std::fs::read_to_string(&path).with_context(|| format!("read Worker vars file {path}"))
+        })
+        .transpose()?;
+    Ok(merge_worker_vars(manifest, contents.as_deref(), overrides))
+}
+
+fn merge_worker_vars(
+    manifest: &Manifest,
+    contents: Option<&str>,
+    overrides: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut vars = BTreeMap::new();
+    for binding in bindings(manifest, "plain_text") {
+        if let (Some(name), Some(value)) = (
+            binding.get("name").and_then(serde_json::Value::as_str),
+            binding.get("text").and_then(serde_json::Value::as_str),
+        ) {
+            vars.insert(name.to_string(), value.to_string());
+        }
+    }
+    if let Some(contents) = contents {
+        for line in contents.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((name, raw)) = line.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let raw = raw.trim();
+            let value = raw
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    raw.strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+                .unwrap_or(raw);
+            vars.insert(name.to_string(), value.to_string());
+        }
+    }
+    vars.extend(overrides);
+    vars.into_iter().collect()
+}
+
+#[cfg(test)]
+mod local_worker_vars_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_secrets_override_file_and_manifest_without_mutating_deployment() {
+        let manifest: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "test", "script_name": "radio", "main_module": null,
+            "do_classes": [], "sqlite_classes": [], "modules": [],
+            "raw_metadata": {"bindings": [
+                {"type": "plain_text", "name": "SECRET", "text": "manifest-default"},
+                {"type": "plain_text", "name": "UNCHANGED", "text": "public"}
+            ]}
+        }))
+        .unwrap();
+        let before = serde_json::to_vec(&manifest).unwrap();
+        let vars: BTreeMap<_, _> = merge_worker_vars(
+            &manifest,
+            Some("# private file\nSECRET='file-secret'\nFILE_ONLY=\"kept\"\nEMPTY=\n"),
+            [("SECRET".into(), "environment-secret".into())],
+        )
+        .into_iter()
+        .collect();
+        assert_eq!(vars["SECRET"], "environment-secret");
+        assert_eq!(vars["FILE_ONLY"], "kept");
+        assert_eq!(vars["EMPTY"], "");
+        assert_eq!(vars["UNCHANGED"], "public");
+        assert_eq!(serde_json::to_vec(&manifest).unwrap(), before);
+    }
 }

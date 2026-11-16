@@ -170,7 +170,7 @@ pub fn pressure_config_from_environment() -> anyhow::Result<celld_logic::pressur
             high_bytes = config.high_bytes,
             rss_hard_bytes = config.rss_hard_bytes,
             "CELLD_MAX_RSS_MB is at or above the absolute cap, so the node \
-             decides on its complete cgroup charge or RSS fallback"
+             decides on RSS and the cgroup working set without an allocator discount"
         );
     }
     Ok(config)

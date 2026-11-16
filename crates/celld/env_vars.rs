@@ -186,24 +186,7 @@ const REMOVED: &[Removed] = &[
         // upgrade on a node that never used the feature.
         empty_was_inert: true,
     },
-    Removed {
-        name: "CELLD_VARS_FILE",
-        replacement: "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
-        // The former reader used the path verbatim, so `CELLD_VARS_FILE=`
-        // selected an empty path and failed instead of doing nothing. An
-        // operator must therefore delete the empty setting.
-        empty_was_inert: false,
-    },
 ];
-
-/// The removed `CELLD_VAR_<NAME>` family. It is a prefix and not a name, so
-/// the table above cannot hold it: celld never knew which names an operator
-/// used. A node started with any of them would run with no override at all,
-/// which reads inside a Worker as a missing secret with nothing in the log.
-const REMOVED_PREFIX: (&str, &str) = (
-    "CELLD_VAR_",
-    "set `vars` in the Wrangler config, or `.dev.vars` for `celld dev`",
-);
 
 /// Validate every typed production variable before the runtime starts.
 ///
@@ -222,14 +205,6 @@ pub fn validate() -> anyhow::Result<()> {
         }
         bail!("{} is removed; {}", removed.name, removed.replacement);
     }
-    let (prefix, replacement) = REMOVED_PREFIX;
-    if let Some(name) = std::env::vars_os().find_map(|(name, _)| {
-        let name = name.to_string_lossy().into_owned();
-        name.starts_with(prefix).then_some(name)
-    }) {
-        bail!("{name} is removed; {replacement}");
-    }
-
     for name in [
         "CELLD_CLOUD",
         "CELLD_LTX_COMPACTION",
@@ -409,4 +384,17 @@ where
     T::Err: std::fmt::Display,
 {
     Ok(positive(name)?.unwrap_or(default))
+}
+
+/// Standalone applications may supply runtime-only secrets. Managed fleets use
+/// upstream's deployment bindings and must not inherit host overrides.
+pub fn validate_worker_overrides(managed: bool) -> anyhow::Result<()> {
+    if managed {
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            anyhow::ensure!(name != "CELLD_VARS_FILE" && !name.starts_with("CELLD_VAR_"),
+                "runtime Worker variable overrides require standalone mode without --control-plane / CELLD_CLOUD");
+        }
+    }
+    Ok(())
 }

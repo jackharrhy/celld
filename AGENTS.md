@@ -6,8 +6,12 @@ runtime contracts remain in [README.md](README.md) and `docs/`.
 Base each refresh on freshly fetched upstream main, verify the selected release,
 and carry only necessary fork patches as clean linear commits. Keep each patch's
 intent reviewable; remove superseded changes and fix up local branch commits.
-Do not add merge commits, rewrite shared main, force-push shared history, delete
-branches, or alter historical release tags. Preserve historical recovery refs.
+Maintain the owned patch series on this fork's `main`; do not add merge commits
+or alter historical release tags. Before an owner-approved history replacement,
+archive displaced unique history with annotated tags and verify their remote
+reachability. Use an exact `--force-with-lease` expectation, never plain force.
+Remove obsolete branches only after preserving unique history and checking for
+active worktrees or users; keep recovery tags.
 
 All Harrhy applications use one qualified Celld artifact, not per-app forks or
 versions. Record immutable source, image and executable identities; validate the

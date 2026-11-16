@@ -12,10 +12,12 @@ earlier fork releases.
 
 ## Consume a release
 
-Release tags are created from qualified clean linear branches based on the
-recorded upstream revision, not by merging into historical fork `main`.
-Preserve that shared history and its recovery refs. Use the release tag and
-`fork.json` to identify the active source; do not assume `origin/main` contains it.
+The fork's default `main` carries the clean linear owned patches on the recorded
+upstream revision. Release tags identify qualified snapshots of that series;
+`main` may also contain later maintenance documentation. Historical fork branches
+are preserved with annotated `archive/*` tags before removal or replacement.
+Use the release tag and `fork.json`, together with the image and binary identities,
+to identify the serving artifact; a newer `main` does not change that artifact.
 Main builds publish immutable candidate images for Linux amd64; matching `fork-*`
 release tags publish versioned and immutable images and update `:latest`.
 Application Dockerfiles copy `/usr/local/bin/celld` from the same qualified image
@@ -183,10 +185,14 @@ Keep `upstream` pointed at `https://github.com/denoland/celld.git`. Fetch upstre
 main and start a new linear branch at that revision. Inventory the previous
 fork's unique patches, retain necessary storage, security and behavior changes,
 and omit fixes already supplied upstream. Preserve upstream dependency security
-floors. Update `fork.json` to the new upstream revision and fork version. Publish a qualified new linear branch and matching release tag without merging
-it into historical fork main. Do not add merge commits to the fork patch series,
-rewrite shared main, force-push shared history, delete branches, or rewrite
-published release tags.
+floors. Update `fork.json` to the new upstream revision and fork version. Maintain
+that linear series on this fork's `main` and create the matching release tag only
+after qualification. Do not add merge commits or rewrite published release tags.
+An owner-approved history replacement must first preserve displaced unique
+history in annotated archive tags, verify those remote tags, and use an exact
+`--force-with-lease` expectation rather than plain force. Remove obsolete branches
+only after their unique history is preserved and no active worktree or user needs
+them. Archive tags must not use the release workflow's `fork-*` prefix.
 
 Qualify the actual Worker executable and fork features before publishing a
 candidate for application use. Record immutable image, fork/upstream source and

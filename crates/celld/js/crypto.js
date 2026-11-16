@@ -249,6 +249,37 @@
           "secret", normalized, extractable, usages, { bytes: raw },
         );
       }
+      if (format === "raw" && (name === "ECDH" || name === "ECDSA")) {
+        const curve = _canonicalEcCurve(algorithm?.namedCurve);
+        if (typeof curve !== "string") throw _notSupported("unsupported named curve");
+        if (Array.from(usages).some((usage) => name !== "ECDSA" || usage !== "verify")) {
+          throw new DOMException("invalid EC public key usages", "SyntaxError");
+        }
+        const bytes = Array.from(_toBuf(keyData));
+        let imported;
+        try {
+          imported = _extra("asym-key-import", {
+            key: bytes,
+            format: "raw",
+            type: curve,
+            visibility: "public",
+            passphrase: null,
+          });
+        } catch {
+          throw new DOMException("invalid EC public key", "DataError");
+        }
+        return _makeKey(
+          "public",
+          _keyAlgorithm(name, algorithm, imported.keyType, imported.details),
+          extractable,
+          usages,
+          {
+            bytes: Uint8Array.from(imported.der),
+            keyType: imported.keyType,
+            details: imported.details,
+          },
+        );
+      }
       // A Secure Curves public key has a `raw` form: the 32-byte point on
       // its own. It is checked before the asymmetric block below, because
       // that block reads `raw` bytes as a DER document and can only report a
@@ -321,14 +352,15 @@
     }
 
     async exportKey(format, key) {
-      // The `raw` form of a Secure Curves public key is its 32-byte point.
-      // The branch below answers every `raw` request from the stored bytes,
-      // which for an asymmetric key are its SPKI document -- so without this
-      // arm an X25519 peer key exports as 44 bytes that no counterpart can
-      // read, and nothing reports an error.
+      if (format === "raw" && key?.type === "private" &&
+          key.__celldMaterial?.keyType === "ec") {
+        throw new DOMException("raw EC keys must be public", "InvalidAccessError");
+      }
+      // Public raw keys are curve points, not the stored SPKI documents.
       if (format === "raw" && key?.type === "public" &&
           (key.__celldMaterial?.keyType === "ed25519" ||
-            key.__celldMaterial?.keyType === "x25519")) {
+            key.__celldMaterial?.keyType === "x25519" ||
+            key.__celldMaterial?.keyType === "ec")) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }
@@ -336,7 +368,8 @@
           der: Array.from(key.__celldMaterial.bytes),
         }).bytes).buffer;
       }
-      if (format === "raw" && key?.__celldMaterial?.bytes) {
+      if (format === "raw" && key?.type === "secret" &&
+          key?.__celldMaterial?.bytes) {
         if (!key.extractable) {
           throw new DOMException("key is not extractable", "InvalidAccessError");
         }

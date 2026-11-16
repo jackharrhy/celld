@@ -105,6 +105,27 @@ but still needs a stopped, complete backup of both object store and replica
 state before first use. Do not publish or deploy this fork release until its
 storage, migration, crash recovery, and application smokes pass.
 
+## Upgrade candidate from 0.6.2 to 0.6.3
+
+The `0.6.3-jh.1` candidate follows upstream
+`8702f6d186c77698dbfb30cf29e3b1922a88f008`. Qualification is not complete;
+this source documentation does not identify a ready fleet artifact.
+
+The upstream 0.6.2-to-0.6.3 change does not rewrite storage or ownership formats.
+It refuses to acquire a cell whose `own.json` is missing while its LTX exists,
+rather than treating it as a new empty cell. Such an already-damaged cell now
+fails closed, with a ten-second retry hold. See `docs/guarantees.md` for the
+stopped-node/log-recovery repair procedure; never manufacture a replacement
+ownership record while a writer or unrecovered node log remains.
+
+Preserve complete stopped backups and the existing 0.6.0 facet-format rollback
+boundary described above. Do not infer that the absence of a new migration makes
+an image-only rollback safe for an older storage format. The candidate retains
+the standalone store and SQLite fixes, runtime secret overrides and upstream TLS
+security floors, and adds standard uncompressed raw EC public-key conversion.
+Actual Worker standards, storage, replication, CLI/SDK and application checks
+must pass before the common fleet artifact is selected.
+
 ## Runtime secrets
 
 For standalone deployments (SQLite and cloud buckets), this fork retains `CELLD_VAR_<NAME>` and

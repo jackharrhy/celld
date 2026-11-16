@@ -982,35 +982,53 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
                 let jwk = args.get("key").ok_or_else(|| anyhow!("missing JWK"))?;
                 (key_from_jwk(jwk, want_private)?, want_private)
             } else if format == "raw" {
-                // Web Crypto's `raw` format for the Secure Curves: a public
-                // key is its 32-byte point, with no structure around it. The
-                // curve therefore cannot be read off the bytes and arrives in
-                // `type`. Only a public key has a `raw` form, so `visibility`
-                // is not consulted.
-                let key = crypto_bytes(args, "key")?;
-                let curve = args
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                let point: [u8; 32] = key
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
-                let der = match curve {
-                    "X25519" => x25519_spki(&point),
-                    "Ed25519" => {
-                        use ed25519_dalek::pkcs8::EncodePublicKey;
-                        // Unlike X25519, an Ed25519 point has to decompress
-                        // to a curve point, so a bad one fails here.
-                        ed25519_dalek::VerifyingKey::from_bytes(&point)
-                            .map_err(|_| anyhow!("invalid Ed25519 public key"))?
-                            .to_public_key_der()?
-                            .as_bytes()
-                            .to_vec()
+                // Web Crypto raw EC keys are uncompressed SEC1 points.
+                let curve = args.get("type").and_then(serde_json::Value::as_str);
+                if matches!(curve, Some("P-256" | "P-384" | "P-521")) {
+                    let key = crypto_bytes(args, "key")?;
+                    if key.first() != Some(&4) {
+                        return Err(anyhow!("EC raw public key must be uncompressed"));
                     }
-                    other => return Err(anyhow!("cannot import a raw {other} key")),
-                };
-                (der, false)
+                    macro_rules! import_point {
+                        ($c:ident) => {{
+                            use $c::pkcs8::EncodePublicKey;
+                            $c::PublicKey::from_sec1_bytes(&key)?
+                                .to_public_key_der()?
+                                .as_bytes()
+                                .to_vec()
+                        }};
+                    }
+                    (ec_curve!(curve.unwrap(), import_point), false)
+                } else {
+                    // Web Crypto's `raw` format for the Secure Curves: a public
+                    // key is its 32-byte point, with no structure around it. The
+                    // curve therefore cannot be read off the bytes and arrives in
+                    // `type`. Visibility is checked below for every format.
+                    let key = crypto_bytes(args, "key")?;
+                    let curve = args
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    let point: [u8; 32] = key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("a {curve} raw public key must be 32 bytes"))?;
+                    let der = match curve {
+                        "X25519" => x25519_spki(&point),
+                        "Ed25519" => {
+                            use ed25519_dalek::pkcs8::EncodePublicKey;
+                            // Unlike X25519, an Ed25519 point has to decompress
+                            // to a curve point, so a bad one fails here.
+                            ed25519_dalek::VerifyingKey::from_bytes(&point)
+                                .map_err(|_| anyhow!("invalid Ed25519 public key"))?
+                                .to_public_key_der()?
+                                .as_bytes()
+                                .to_vec()
+                        }
+                        other => return Err(anyhow!("cannot import a raw {other} key")),
+                    };
+                    (der, false)
+                }
             } else {
                 let key = crypto_bytes(args, "key")?;
                 let stated = args.get("type").and_then(serde_json::Value::as_str);
@@ -1294,6 +1312,19 @@ fn crypto_operation(operation: &str, args: &serde_json::Value) -> Result<serde_j
             let der = crypto_bytes(args, "der")?;
             let parsed = describe_key(&der, false)?;
             let point = match parsed.kind {
+                "ec" => {
+                    macro_rules! export_point {
+                        ($c:ident) => {{
+                            use $c::pkcs8::DecodePublicKey;
+                            use $c::elliptic_curve::sec1::ToEncodedPoint;
+                            $c::PublicKey::from_public_key_der(&der)?
+                                .to_encoded_point(false)
+                                .as_bytes()
+                                .to_vec()
+                        }};
+                    }
+                    ec_curve!(ec_jwk_crv(&parsed)?, export_point)
+                }
                 "x25519" => x25519_material(&der, false)?.to_vec(),
                 "ed25519" => {
                     use ed25519_dalek::pkcs8::DecodePublicKey;

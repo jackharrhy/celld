@@ -33,7 +33,7 @@ azure = ["object_store/azure"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
-# Aligned to celld's rusqlite (crates/celld pins 0.31); libsqlite3-sys carries
+# Aligned to celld's rusqlite (crates/celld pins 0.39); libsqlite3-sys carries
 # links="sqlite3", so the workspace cannot hold two versions.
 rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 object_store.workspace = true

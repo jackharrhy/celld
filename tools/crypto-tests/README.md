@@ -27,6 +27,9 @@ key and exact JWT claims. Its fixed historical timestamp is only a fixture.
 node tools/crypto-tests/run.mjs /absolute/candidate/celld /absolute/native/esbuild
 ```
 
+The optional `runtime` suite uses the same runner for standalone storage and
+crash recovery; see `../runtime-tests/README.md`.
+
 Run it only inside a bounded OS sandbox with isolated loopback, empty environment,
 read-only source/toolchain and scratch-only writes. The runner itself supplies a
 small explicit child environment but does not create the OS boundary. It prints

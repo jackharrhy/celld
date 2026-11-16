@@ -105,11 +105,13 @@ but still needs a stopped, complete backup of both object store and replica
 state before first use. Do not publish or deploy this fork release until its
 storage, migration, crash recovery, and application smokes pass.
 
-## Upgrade candidate from 0.6.2 to 0.6.3
+## Upgrade from 0.6.2 to 0.6.3
 
-The `0.6.3-jh.1` candidate follows upstream
-`8702f6d186c77698dbfb30cf29e3b1922a88f008`. Qualification is not complete;
-this source documentation does not identify a ready fleet artifact.
+Version `0.6.3-jh.1` follows upstream
+`8702f6d186c77698dbfb30cf29e3b1922a88f008`. A source version alone does not
+identify a qualified fleet artifact: record the immutable image, executable
+SHA-256 and source revisions together before consumption. Release publication
+does not authorize runtime replacement.
 
 The upstream 0.6.2-to-0.6.3 change does not rewrite storage or ownership formats.
 It refuses to acquire a cell whose `own.json` is missing while its LTX exists,
@@ -120,11 +122,15 @@ ownership record while a writer or unrecovered node log remains.
 
 Preserve complete stopped backups and the existing 0.6.0 facet-format rollback
 boundary described above. Do not infer that the absence of a new migration makes
-an image-only rollback safe for an older storage format. The candidate retains
+an image-only rollback safe for an older storage format. This version retains
 the standalone store and SQLite fixes, runtime secret overrides and upstream TLS
 security floors, and adds standard uncompressed raw EC public-key conversion.
 Actual Worker standards, storage, replication, CLI/SDK and application checks
-must pass before the common fleet artifact is selected.
+must pass before the common fleet artifact is selected. The tracked
+`tools/crypto-tests` and `tools/runtime-tests` fixtures cover standards vectors,
+independent VAPID verification, R2/SQL and empty-replica crash recovery. Build on
+the Dockerfile's Bookworm baseline; a binary linked against a newer host glibc
+is not compatible evidence for the existing application images.
 
 ## Runtime secrets
 

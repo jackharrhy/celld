@@ -1,0 +1,9 @@
+{
+  "name": "celld-fork-runtime-regression",
+  "main": "worker.js",
+  "compatibility_date": "2026-01-01",
+  "vars": { "TEST_SECRET": "manifest-default" },
+  "durable_objects": { "bindings": [{ "name": "STATE", "class_name": "State" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["State"] }],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "qualification-only" }]
+}

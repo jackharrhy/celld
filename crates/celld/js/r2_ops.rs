@@ -94,6 +94,7 @@ pub(super) fn op_r2_get(
     let stream_service = http_stream_service();
     let id = asyncrt::enqueue(async move {
         let request = request?;
+        let ranged = request.range.is_some();
         let range = request
             .range
             .map(BlobRange::from)
@@ -113,7 +114,7 @@ pub(super) fn op_r2_get(
                     .ok_or_else(|| format!("R2 get: {HTTP_STREAM_REGISTRATION_CLOSED}"))?;
                 serde_json::json!({
                     "state": "hit",
-                    "object": object_json(&key, &blob.meta, Some(blob.range)),
+                    "object": object_json(&key, &blob.meta, ranged.then_some(blob.range)),
                     "streamId": stream_id,
                 })
                 .to_string()

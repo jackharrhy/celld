@@ -13,6 +13,10 @@ path = "lib.rs"
 name = "celld"
 path = "main.rs"
 
+[[bin]]
+name = "celld-store-copy"
+path = "bin/store_copy.rs"
+
 [lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = ["cfg(celld_internal_tests)", "cfg(celld_proxy_internals)"]

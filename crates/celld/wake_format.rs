@@ -28,6 +28,29 @@ fn decode(bytes: &[u8]) -> anyhow::Result<FormatRecord> {
 /// complete inventory permits serving; lagging starters can only add obsolete
 /// discovery seeds, whose retirement order is below every writer identity.
 pub async fn ensure_ready(bucket: &Bucket) -> anyhow::Result<()> {
+    ensure_ready_with_runtime_lock(bucket, None).await
+}
+
+/// Runtime startup already owns the local authority. Other callers must take
+/// that same lock before migrating, but ordinary deployments remain online.
+pub async fn ensure_ready_with_runtime_lock(
+    bucket: &Bucket,
+    runtime_guard: Option<&std::fs::File>,
+) -> anyhow::Result<()> {
+    if let Some((bytes, _)) = bucket.get(KEY).await? {
+        if !decode(&bytes)?.migrating {
+            return Ok(());
+        }
+    }
+    let _migration_guard = if matches!(bucket.backend, crate::bucket::StorageBackend::Local)
+        && runtime_guard.is_none()
+    {
+        Some(crate::local_storage::lock_runtime(std::path::Path::new(
+            &bucket.name,
+        ))?)
+    } else {
+        None
+    };
     let result = initialize(bucket).await;
     if result.is_err() {
         // Another starter can finish and acquire its node lease while this
@@ -191,4 +214,107 @@ async fn ensure_legacy_layout(bucket: &Bucket) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod local_migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_migration_contract() {
+        crate::asyncrt::set_host_handle(tokio::runtime::Handle::current());
+        migration_requires_local_authority_and_ready_deploys_remain_online().await;
+        interrupted_legacy_inventory_resumes_and_preserves_application_objects().await;
+        live_legacy_lease_prevents_migration_without_publishing_marker().await;
+    }
+
+    async fn migration_requires_local_authority_and_ready_deploys_remain_online() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("objects.sqlite3");
+        let bucket = Bucket::open_dev(&path).unwrap();
+        let guard = crate::local_storage::lock_runtime(&path).unwrap();
+        assert!(ensure_ready(&bucket).await.is_err());
+        assert!(bucket.get(KEY).await.unwrap().is_none());
+        ensure_ready_with_runtime_lock(&bucket, Some(&guard))
+            .await
+            .unwrap();
+        ensure_ready(&bucket).await.unwrap();
+    }
+
+    async fn interrupted_legacy_inventory_resumes_and_preserves_application_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("objects.sqlite3")).unwrap();
+        for index in 0..130 {
+            bucket
+                .put(&format!("cells/Room:{index}/owner.json"), b"owner".to_vec())
+                .await
+                .unwrap();
+        }
+        bucket
+            .put("r2/tracks/song", b"audio".to_vec())
+            .await
+            .unwrap();
+        bucket
+            .put(KEY, br#"{"format":2,"migrating":true}"#.to_vec())
+            .await
+            .unwrap();
+        bucket
+            .put(
+                &celld_logic::wake::migration_seed_key("Room:0"),
+                br#"{"format":2,"cell":"Room:0","migration_seed":true}"#.to_vec(),
+            )
+            .await
+            .unwrap();
+        ensure_ready(&bucket).await.unwrap();
+        for index in 0..130 {
+            assert!(bucket
+                .get(&celld_logic::wake::migration_seed_key(&format!(
+                    "Room:{index}"
+                )))
+                .await
+                .unwrap()
+                .is_some());
+        }
+        assert_eq!(
+            bucket.get("r2/tracks/song").await.unwrap().unwrap().0,
+            b"audio".as_slice()
+        );
+        assert_eq!(
+            bucket
+                .get("cells/Room:0/owner.json")
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            b"owner".as_slice()
+        );
+        assert!(
+            !decode(&bucket.get(KEY).await.unwrap().unwrap().0)
+                .unwrap()
+                .migrating
+        );
+    }
+
+    async fn live_legacy_lease_prevents_migration_without_publishing_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let bucket = Bucket::open_dev(&dir.path().join("objects.sqlite3")).unwrap();
+        bucket
+            .put(
+                "nodes/old",
+                serde_json::to_vec(&serde_json::json!({"expires_ms": u64::MAX})).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(ensure_ready(&bucket)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("still live"));
+        assert!(bucket.get(KEY).await.unwrap().is_none());
+        bucket
+            .put("nodes/old", br#"{"expires_ms":0}"#.to_vec())
+            .await
+            .unwrap();
+        ensure_ready(&bucket).await.unwrap();
+    }
 }

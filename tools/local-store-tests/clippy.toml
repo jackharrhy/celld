@@ -1,0 +1,5 @@
+# Standalone test and build plumbing intentionally uses host I/O and Tokio.
+# Production source is also linted through the main workspace's boundary rules.
+disallowed-methods = []
+disallowed-types = []
+disallowed-macros = []

@@ -3628,6 +3628,17 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
         }
         Action::Run(settings) => settings,
     };
+    celld::env_vars::validate_worker_overrides(settings.control_plane)?;
+    // One runtime per local authority. Deploy/diagnose use SQLite normally;
+    // offline migration takes this same guard and cannot race a running node.
+    let _local_store_guard = settings
+        .bucket
+        .as_deref()
+        .map(celld::local_storage::path_from_spec)
+        .transpose()?
+        .flatten()
+        .map(|database| celld::local_storage::lock_runtime(&database))
+        .transpose()?;
     // Operators need the applied worker count to verify CELLD_TOKIO_THREADS;
     // a count of process threads also includes unrelated, lazily started
     // thread pools, so it cannot stand in for this value.
@@ -3679,7 +3690,7 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                     celld::bucket::StorageBackend::Gcs => "gs",
                     celld::bucket::StorageBackend::Azure => "az",
                     celld::bucket::StorageBackend::S3 => "s3",
-                    celld::bucket::StorageBackend::Local => "dev",
+                    celld::bucket::StorageBackend::Local => "sqlite",
                 }
             );
             // The control plane issues one bucket per fleet and its enrollment
@@ -3783,76 +3794,237 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
     // watcher through. Without a deployment bucket the receiver is dropped
     // and a reload reports that there is no pointer to reload from.
     let (reload_tx, reload_rx) = celld::generation::reload_channel();
-    let (runtime, ownership, peer_key, wake_scan, deploy_bucket) =
-        if settings.bucket.is_some() && settings.load_deployment {
+    let (runtime, ownership, peer_key, wake_scan, deploy_bucket) = if settings.bucket.is_some()
+        && settings.load_deployment
+    {
+        let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+        if settings.control_plane {
+            fleet::validate_managed_bucket(&client).await?;
+        } else {
+            fleet::validate_bucket(&client).await?;
+        }
+        celld::wake_format::ensure_ready_with_runtime_lock(&client, _local_store_guard.as_ref())
+            .await?;
+        // The list above proves the bucket answers; it does not prove the
+        // store enforces the conditional writes or ranged reads that a
+        // cell needs. Test both contracts here before the node serves.
+        fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
+        let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+        if settings.control_plane {
+            celld::control_plane::wait_for_initial_deployment(&client).await?;
+            deploy_agent = Some(client.clone());
+        } else {
+            // A self-hosted node can start before its first `celld
+            // deploy`; wait for the pointer instead of exiting, or
+            // systemd restarts the node in a loop until a deployment
+            // exists. Managed mode already waited above.
+            fleet::wait_for_deployment_pointer(&client).await?;
+        }
+        let peer_key = peer_auth::load_or_create(&client).await?;
+        let graph = DeploymentGraph::load(&client, node.clone()).await?;
+        let wake = Arc::new(celld::wake::WakeFlusher::new());
+        celld::js::set_arm_gate(ArmGate {
+            bucket: client.clone(),
+            flusher: wake.clone(),
+        });
+        // An `r2_buckets` binding lives in the fleet bucket, under the
+        // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
+        // rather than providing it, so a binding gets the store the node
+        // already holds credentials for instead of a second one.
+        celld::js::set_r2_store(client.clone());
+        // celld treats replication as a node service, not as a property
+        // of today's manifest. Start it even for a stateless deployment
+        // so a later deployment can introduce cells without changing the
+        // durability contract underneath the node.
+        let replication = Some(Replication::start(
+            client.clone(),
+            &data_dir,
+            settings.endpoint.clone(),
+            settings.region.clone(),
+            storage_credentials.clone(),
+        )?);
+        // The same two calls a reload makes: there is no boot-only way from
+        // a deployment to a serving generation.
+        let generation = Generation::build(
+            FIRST_GENERATION,
+            graph,
+            GenerationOptions {
+                node: node.clone(),
+                region: settings.region.clone(),
+            },
+        )?;
+        let runtime = RuntimeManager::start(
+            generation,
+            RuntimeOptions {
+                data_dir: data_dir.clone(),
+                replication,
+                wake: Some(wake.clone()),
+                alarm_observer: alarm_observer.clone(),
+                node: node.clone(),
+                region: settings.region.clone(),
+                bucket: Some(client.clone()),
+            },
+        )?;
+        let deploy_bucket = Some(client.clone());
+        let bucket_ownership = Arc::new(
+            BucketOwnership::new(
+                client.clone(),
+                lease_client,
+                node.clone(),
+                probe_public_key.clone(),
+            )
+            .with_lease_ttl_ms(lease_ttl_ms_from_environment())
+            .with_fleet_sample_ms(fleet_sample_ms),
+        );
+        let wake_scan = Some((client, bucket_ownership.clone()));
+        let ownership = Ownership::Bucket(bucket_ownership);
+        (
+            Some(runtime),
+            Some(ownership),
+            peer_key,
+            wake_scan,
+            deploy_bucket,
+        )
+    } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
+        let source = std::fs::read_to_string(&script_path)?;
+        let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
+            .filter(|(name, class)| !name.is_empty() && !class.is_empty())
+            .collect();
+        // `BINDING=database` pairs, the local-script equivalent of
+        // `d1_databases` in a deployed project.
+        let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
+            .filter(|(name, database)| !name.is_empty() && !database.is_empty())
+            .collect();
+        // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
+        // for the reason D1's and Workflows' equivalents landed on day one:
+        // every runtime test needs it.
+        let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
+            .filter(|(name, id)| !name.is_empty() && !id.is_empty())
+            .collect();
+        // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
+        // producer. A local binding has no configuration object for a default
+        // delay, so it uses the Queue default of zero.
+        let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(environment, queue)| QueueBinding {
+                environment: environment.trim().to_string(),
+                queue: queue.trim().to_string(),
+                delivery_delay: 0,
+            })
+            .filter(|binding| !binding.environment.is_empty() && !binding.queue.is_empty())
+            .collect();
+        for binding in &queue_bindings {
+            anyhow::ensure!(
+                celld_logic::cell::valid_cell_scope(&binding.queue),
+                "local Queue binding {} has a queue name that cannot name a cell: {:?}",
+                binding.environment,
+                binding.queue,
+            );
+        }
+        // `BINDING=bucket` pairs, the local-script equivalent of
+        // `r2_buckets` in a deployed project.
+        let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| value.split_once('='))
+            .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
+            .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
+            .collect();
+        let mut do_classes: Vec<String> = do_classes;
+        if !d1_bindings.is_empty() {
+            do_classes.push(celld::deploy::D1_CLASS.to_string());
+        }
+        if !kv_bindings.is_empty() {
+            do_classes.push(celld::deploy::KV_CLASS.to_string());
+        }
+        if !queue_bindings.is_empty() {
+            do_classes.push(celld::deploy::QUEUE_CLASS.to_string());
+        }
+        let workflow_bindings: Vec<WorkflowBinding> =
+            std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| {
+                    let (binding, rest) = value.split_once('=')?;
+                    let (name, class) = rest.split_once('=')?;
+                    Some(WorkflowBinding {
+                        environment: binding.trim().to_string(),
+                        workflow: name.trim().to_string(),
+                        class: class.trim().to_string(),
+                    })
+                })
+                .filter(|binding| {
+                    !binding.environment.is_empty()
+                        && !binding.workflow.is_empty()
+                        && !binding.class.is_empty()
+                })
+                .collect();
+        // Resolved before the config is built, because the reserved workflow
+        // class is script-scoped and `do_classes` has to carry the scoped name.
+        let script_name =
+            std::env::var("CELLD_TEST_SCRIPT_NAME").unwrap_or_else(|_| "celld-local".to_string());
+        if !workflow_bindings.is_empty() {
+            do_classes.push(celld::deploy::workflow_class(&script_name));
+        }
+        let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
+            .unwrap_or_default()
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect();
+        let options = WorkerConfigOptions {
+            src: source,
+            script_name,
+            do_classes,
+            bindings,
+            r2_bindings,
+            d1_bindings,
+            kv_bindings,
+            queue_bindings,
+            queue_consumers: Vec::new(),
+            workflow_bindings,
+            vars: Vec::new(),
+            node: node.clone(),
+            modules: Vec::new(),
+            compat: Compat::default(),
+        };
+        let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
             let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-            if settings.control_plane {
-                fleet::validate_managed_bucket(&client).await?;
-            } else {
-                fleet::validate_bucket(&client).await?;
-            }
-            celld::wake_format::ensure_ready(&client).await?;
-            // The list above proves the bucket answers; it does not prove the
-            // store enforces the conditional writes or ranged reads that a
-            // cell needs. Test both contracts here before the node serves.
-            fleet::probe_storage_before_serving(&client, settings.control_plane).await?;
+            celld::wake_format::ensure_ready_with_runtime_lock(
+                &client,
+                _local_store_guard.as_ref(),
+            )
+            .await?;
             let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-            if settings.control_plane {
-                celld::control_plane::wait_for_initial_deployment(&client).await?;
-                deploy_agent = Some(client.clone());
-            } else {
-                // A self-hosted node can start before its first `celld
-                // deploy`; wait for the pointer instead of exiting, or
-                // systemd restarts the node in a loop until a deployment
-                // exists. Managed mode already waited above.
-                fleet::wait_for_deployment_pointer(&client).await?;
-            }
             let peer_key = peer_auth::load_or_create(&client).await?;
-            let graph = DeploymentGraph::load(&client, node.clone()).await?;
             let wake = Arc::new(celld::wake::WakeFlusher::new());
             celld::js::set_arm_gate(ArmGate {
                 bucket: client.clone(),
                 flusher: wake.clone(),
             });
-            // An `r2_buckets` binding lives in the fleet bucket, under the
-            // reserved `r2/<bucket_name>/` prefix. celld runs on blob storage
-            // rather than providing it, so a binding gets the store the node
-            // already holds credentials for instead of a second one.
             celld::js::set_r2_store(client.clone());
-            // celld treats replication as a node service, not as a property
-            // of today's manifest. Start it even for a stateless deployment
-            // so a later deployment can introduce cells without changing the
-            // durability contract underneath the node.
-            let replication = Some(Replication::start(
-                client.clone(),
-                &data_dir,
-                settings.endpoint.clone(),
-                settings.region.clone(),
-                storage_credentials.clone(),
-            )?);
-            // The same two calls a reload makes: there is no boot-only way from
-            // a deployment to a serving generation.
-            let generation = Generation::build(
-                FIRST_GENERATION,
-                graph,
-                GenerationOptions {
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                },
-            )?;
-            let runtime = RuntimeManager::start(
-                generation,
-                RuntimeOptions {
-                    data_dir: data_dir.clone(),
-                    replication,
-                    wake: Some(wake.clone()),
-                    alarm_observer: alarm_observer.clone(),
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                    bucket: Some(client.clone()),
-                },
-            )?;
-            let deploy_bucket = Some(client.clone());
             let bucket_ownership = Arc::new(
                 BucketOwnership::new(
                     client.clone(),
@@ -3864,248 +4036,97 @@ async fn async_main(telemetry_config: Option<celld::telemetry::Config>) -> anyho
                 .with_fleet_sample_ms(fleet_sample_ms),
             );
             let wake_scan = Some((client, bucket_ownership.clone()));
-            let ownership = Ownership::Bucket(bucket_ownership);
             (
-                Some(runtime),
-                Some(ownership),
+                Some(Ownership::Bucket(bucket_ownership)),
                 peer_key,
+                Some(wake),
                 wake_scan,
-                deploy_bucket,
             )
-        } else if let Ok(script_path) = std::env::var("CELLD_TEST_SCRIPT_PATH") {
-            let source = std::fs::read_to_string(&script_path)?;
-            let do_classes = std::env::var("CELLD_TEST_DO_CLASSES")
-                .unwrap_or_default()
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect();
-            let bindings = std::env::var("CELLD_TEST_DO_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, class)| (name.trim().to_string(), class.trim().to_string()))
-                .filter(|(name, class)| !name.is_empty() && !class.is_empty())
-                .collect();
-            // `BINDING=database` pairs, the local-script equivalent of
-            // `d1_databases` in a deployed project.
-            let d1_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_D1_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, database)| (name.trim().to_string(), database.trim().to_string()))
-                .filter(|(name, database)| !name.is_empty() && !database.is_empty())
-                .collect();
-            // `BINDING=namespace-id`, the `CELLD_TEST_D1_BINDINGS` shape. Day one,
-            // for the reason D1's and Workflows' equivalents landed on day one:
-            // every runtime test needs it.
-            let kv_bindings: Vec<(String, String)> = std::env::var("CELLD_LOCAL_KV_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, id)| (name.trim().to_string(), id.trim().to_string()))
-                .filter(|(name, id)| !name.is_empty() && !id.is_empty())
-                .collect();
-            // `BINDING=queue`, the local-script equivalent of one Wrangler Queue
-            // producer. A local binding has no configuration object for a default
-            // delay, so it uses the Queue default of zero.
-            let queue_bindings: Vec<QueueBinding> = std::env::var("CELLD_LOCAL_QUEUE_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(environment, queue)| QueueBinding {
-                    environment: environment.trim().to_string(),
-                    queue: queue.trim().to_string(),
-                    delivery_delay: 0,
-                })
-                .filter(|binding| !binding.environment.is_empty() && !binding.queue.is_empty())
-                .collect();
-            for binding in &queue_bindings {
-                anyhow::ensure!(
-                    celld_logic::cell::valid_cell_scope(&binding.queue),
-                    "local Queue binding {} has a queue name that cannot name a cell: {:?}",
-                    binding.environment,
-                    binding.queue,
-                );
-            }
-            // `BINDING=bucket` pairs, the local-script equivalent of
-            // `r2_buckets` in a deployed project.
-            let r2_bindings: Vec<(String, String)> = std::env::var("CELLD_TEST_R2_BINDINGS")
-                .unwrap_or_default()
-                .split(',')
-                .filter_map(|value| value.split_once('='))
-                .map(|(name, bucket)| (name.trim().to_string(), bucket.trim().to_string()))
-                .filter(|(name, bucket)| !name.is_empty() && !bucket.is_empty())
-                .collect();
-            let mut do_classes: Vec<String> = do_classes;
-            if !d1_bindings.is_empty() {
-                do_classes.push(celld::deploy::D1_CLASS.to_string());
-            }
-            if !kv_bindings.is_empty() {
-                do_classes.push(celld::deploy::KV_CLASS.to_string());
-            }
-            if !queue_bindings.is_empty() {
-                do_classes.push(celld::deploy::QUEUE_CLASS.to_string());
-            }
-            let workflow_bindings: Vec<WorkflowBinding> =
-                std::env::var("CELLD_LOCAL_WORKFLOW_BINDINGS")
+        } else {
+            (None, random_peer_key(), None, None)
+        };
+        // A local script is a one-script deployment with no pointer behind
+        // it, built through the same function as a bucket deployment.
+        let script_name = options.script_name.clone();
+        let generation = Generation::build(
+            FIRST_GENERATION,
+            DeploymentGraph::single(fleet::LoadedDeployment {
+                options,
+                script_name,
+                version: "local".to_string(),
+                prefix: script_path.clone(),
+                asset_binding: None,
+                // A bare script has no wrangler config, so this names the
+                // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
+                // a comma-separated list, because a config can declare
+                // more than one loader. It is the local-script equivalent
+                // of `worker_loaders`, and not a production switch: a
+                // deployed project reaches a loader only through its own
+                // config.
+                loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
                     .unwrap_or_default()
                     .split(',')
-                    .filter_map(|value| {
-                        let (binding, rest) = value.split_once('=')?;
-                        let (name, class) = rest.split_once('=')?;
-                        Some(WorkflowBinding {
-                            environment: binding.trim().to_string(),
-                            workflow: name.trim().to_string(),
-                            class: class.trim().to_string(),
-                        })
-                    })
-                    .filter(|binding| {
-                        !binding.environment.is_empty()
-                            && !binding.workflow.is_empty()
-                            && !binding.class.is_empty()
-                    })
-                    .collect();
-            // Resolved before the config is built, because the reserved workflow
-            // class is script-scoped and `do_classes` has to carry the scoped name.
-            let script_name = std::env::var("CELLD_TEST_SCRIPT_NAME")
-                .unwrap_or_else(|_| "celld-local".to_string());
-            if !workflow_bindings.is_empty() {
-                do_classes.push(celld::deploy::workflow_class(&script_name));
-            }
-            let crons: Vec<String> = std::env::var("CELLD_TEST_CRONS")
-                .unwrap_or_default()
-                .split(';')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect();
-            let options = WorkerConfigOptions {
-                src: source,
-                script_name,
-                do_classes,
-                bindings,
-                r2_bindings,
-                d1_bindings,
-                kv_bindings,
-                queue_bindings,
-                queue_consumers: Vec::new(),
-                workflow_bindings,
-                vars: Vec::new(),
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                assets: None,
+                services: Vec::new(),
+                crons,
+                containers: Vec::new(),
+                fence_image: None,
+            }),
+            GenerationOptions {
                 node: node.clone(),
-                modules: Vec::new(),
-                compat: Compat::default(),
-            };
-            let (ownership, peer_key, wake, wake_scan) = if settings.bucket.is_some() {
-                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-                celld::wake_format::ensure_ready(&client).await?;
-                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-                let peer_key = peer_auth::load_or_create(&client).await?;
-                let wake = Arc::new(celld::wake::WakeFlusher::new());
-                celld::js::set_arm_gate(ArmGate {
-                    bucket: client.clone(),
-                    flusher: wake.clone(),
-                });
-                celld::js::set_r2_store(client.clone());
-                let bucket_ownership = Arc::new(
+                region: settings.region.clone(),
+            },
+        )?;
+        (
+            Some(RuntimeManager::start(
+                generation,
+                RuntimeOptions {
+                    data_dir: data_dir.clone(),
+                    replication: None,
+                    wake: wake.clone(),
+                    alarm_observer: alarm_observer.clone(),
+                    node: node.clone(),
+                    region: settings.region.clone(),
+                    bucket: None,
+                },
+            )?),
+            ownership,
+            peer_key,
+            wake_scan,
+            None,
+        )
+    } else {
+        let (ownership, peer_key) = if settings.bucket.is_some() {
+            let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
+            celld::wake_format::ensure_ready_with_runtime_lock(
+                &client,
+                _local_store_guard.as_ref(),
+            )
+            .await?;
+            let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
+            let peer_key = peer_auth::load_or_create(&client).await?;
+            (
+                Some(Ownership::Bucket(Arc::new(
                     BucketOwnership::new(
-                        client.clone(),
+                        client,
                         lease_client,
                         node.clone(),
                         probe_public_key.clone(),
                     )
                     .with_lease_ttl_ms(lease_ttl_ms_from_environment())
                     .with_fleet_sample_ms(fleet_sample_ms),
-                );
-                let wake_scan = Some((client, bucket_ownership.clone()));
-                (
-                    Some(Ownership::Bucket(bucket_ownership)),
-                    peer_key,
-                    Some(wake),
-                    wake_scan,
-                )
-            } else {
-                (None, random_peer_key(), None, None)
-            };
-            // A local script is a one-script deployment with no pointer behind
-            // it, built through the same function as a bucket deployment.
-            let script_name = options.script_name.clone();
-            let generation = Generation::build(
-                FIRST_GENERATION,
-                DeploymentGraph::single(fleet::LoadedDeployment {
-                    options,
-                    script_name,
-                    version: "local".to_string(),
-                    prefix: script_path.clone(),
-                    asset_binding: None,
-                    // A bare script has no wrangler config, so this names the
-                    // loaders the way `CELLD_TEST_DO_CLASSES` names a class:
-                    // a comma-separated list, because a config can declare
-                    // more than one loader. It is the local-script equivalent
-                    // of `worker_loaders`, and not a production switch: a
-                    // deployed project reaches a loader only through its own
-                    // config.
-                    loader_bindings: std::env::var("CELLD_TEST_WORKER_LOADER")
-                        .unwrap_or_default()
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_string)
-                        .collect(),
-                    assets: None,
-                    services: Vec::new(),
-                    crons,
-                    containers: Vec::new(),
-                    fence_image: None,
-                }),
-                GenerationOptions {
-                    node: node.clone(),
-                    region: settings.region.clone(),
-                },
-            )?;
-            (
-                Some(RuntimeManager::start(
-                    generation,
-                    RuntimeOptions {
-                        data_dir: data_dir.clone(),
-                        replication: None,
-                        wake: wake.clone(),
-                        alarm_observer: alarm_observer.clone(),
-                        node: node.clone(),
-                        region: settings.region.clone(),
-                        bucket: None,
-                    },
-                )?),
-                ownership,
+                ))),
                 peer_key,
-                wake_scan,
-                None,
             )
         } else {
-            let (ownership, peer_key) = if settings.bucket.is_some() {
-                let client = node_bucket(&settings, managed_storage.as_ref(), false)?;
-                celld::wake_format::ensure_ready(&client).await?;
-                let lease_client = node_bucket(&settings, managed_storage.as_ref(), true)?;
-                let peer_key = peer_auth::load_or_create(&client).await?;
-                (
-                    Some(Ownership::Bucket(Arc::new(
-                        BucketOwnership::new(
-                            client,
-                            lease_client,
-                            node.clone(),
-                            probe_public_key.clone(),
-                        )
-                        .with_lease_ttl_ms(lease_ttl_ms_from_environment())
-                        .with_fleet_sample_ms(fleet_sample_ms),
-                    ))),
-                    peer_key,
-                )
-            } else {
-                (None, random_peer_key())
-            };
-            (None, ownership, peer_key, None, None)
+            (None, random_peer_key())
         };
+        (None, ownership, peer_key, None, None)
+    };
     if let Some(config) = &telemetry_config {
         let sink_bucket = match &config.sink {
             celld::telemetry::SinkChoice::Bucket => {

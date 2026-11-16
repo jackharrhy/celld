@@ -1,5 +1,9 @@
 # celld
 
+This fork adds standalone SQLite object storage and runtime secret injection.
+See [FORK.md](FORK.md) for fork-specific setup, checks, release identity and
+upgrade boundaries; [AGENTS.md](AGENTS.md) describes maintenance policy.
+
 Self-hosted, distributed **Durable Objects**.
 
 celld is an open-source daemon that runs a Cloudflare Workers application
